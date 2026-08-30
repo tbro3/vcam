@@ -1894,7 +1894,10 @@ static NSString *vcamLightColorName(uint32_t c) {
 // 保密需求(T 表保护重点是打光颜色/门限, md 端消费已设备验证 ok=1),
 // 按原版值硬编码: zoom 1.0~4.0 步进 ×1.10(1.3.34), pan 步进 5%。
 static double vcamTZoomFactor(void) { return 1.10; }
-static double vcamTZoomMin(void)    { return 1.0; }
+// 1.3.82 修复: min 曾误设 1.0 —— 初始 zoom=1.0 时点"−"算出 0.909 被 clamp
+// 回 1.0, 永远无反应(需先"＋"过才能缩)。注释/GPU 侧(bakeUserTransform
+// clamp 0.5..4.0)设计均为 0.5, 恢复 0.5: 默认状态可直接缩小到四周露黑边
+static double vcamTZoomMin(void)    { return 0.5; }
 static double vcamTZoomMax(void)    { return 4.0; }
 static double vcamTPanStep(void)    { return 0.05; }
 
