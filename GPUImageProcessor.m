@@ -2052,9 +2052,17 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     }
 
     // 源/目标宽高比正交(一横一竖) -> CCW90
+    // 1.3.86 双正交修复: 翻回基准正交(189 类设备: 显示主流横 buffer + App
+    // transform, CCW90 抵消手动翻转保显示角=m) **或** 实际源正交(iPhone13 类
+    // 设备: 视频模式显示主流为竖 p420 流 —— 翻回判定下点转后横帧 720x540 直塞
+    // 竖 dst 1080x2340, 大幅裁剪中 p420 写入不完整 → 左条视频+右侧绿, 设备
+    // 实证 1.3.85)。实际正交补 CCW90 后竖流收竖帧(几何对齐拍照模式正常路径),
+    // 横流仍走翻回正交原路径, 两类设备/两类流全兼容
     double srcRatio = (double)baseW / (double)baseH;
     double dstRatio = (double)targetW / (double)targetH;
-    BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0);
+    double actualRatio = (double)srcW / (double)srcH;
+    BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0)
+                   || (actualRatio > 1.0 && dstRatio < 1.0) || (actualRatio < 1.0 && dstRatio > 1.0);
     if (!orthogonal) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
