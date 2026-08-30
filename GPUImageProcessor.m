@@ -1304,7 +1304,12 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     }
 }
 
-// Trim crop offset 非整数判定: 水平/垂直 crop 总量非正偶数 → offset x.5/x.33 非整
+// Trim crop 判定(1.3.87 放宽): ①offset 非整数(半像素越界绿线, 1.3.50 原判)
+// ②大幅裁剪(crop 量 > 源边 25%)—— p420 私有格式 Trim 大裁剪写入不完整,
+// 设备实证(iPhone13 视频模式 r90: 720x540 BGRA→1080x2340 p420, crop 2040px
+// 整数 offset)左侧视频条+右侧全绿; 拍照模式 r0(crop 675 非整数)恰走预裁剪
+// 才一直正常。CPU 中心预裁剪(dst 比例窗口)+Normal 等比语义等价 Trim, 全几何
+// 通用化。裁剪量小(<=25%)保留 Trim 直转(零拷贝快路径)
 static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
     *fixH = NO; *fixV = NO;
     if (!src || !dst) return;
@@ -1316,11 +1321,13 @@ static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, B
     double cropH = srcH * sc - dstH;
     if (cropW > 0.5) {
         double off = cropW / 2.0;
-        *fixH = (fabs(off - floor(off + 0.5)) > 1e-3);  // offset 非整数
+        *fixH = (fabs(off - floor(off + 0.5)) > 1e-3)   // offset 非整数
+             || (cropW > (double)srcW * 0.25);           // 大幅裁剪(1.3.87)
     }
     if (cropH > 0.5) {
         double off = cropH / 2.0;
-        *fixV = (fabs(off - floor(off + 0.5)) > 1e-3);
+        *fixV = (fabs(off - floor(off + 0.5)) > 1e-3)
+             || (cropH > (double)srcH * 0.25);
     }
 }
 
@@ -2052,17 +2059,13 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     }
 
     // 源/目标宽高比正交(一横一竖) -> CCW90
-    // 1.3.86 双正交修复: 翻回基准正交(189 类设备: 显示主流横 buffer + App
-    // transform, CCW90 抵消手动翻转保显示角=m) **或** 实际源正交(iPhone13 类
-    // 设备: 视频模式显示主流为竖 p420 流 —— 翻回判定下点转后横帧 720x540 直塞
-    // 竖 dst 1080x2340, 大幅裁剪中 p420 写入不完整 → 左条视频+右侧绿, 设备
-    // 实证 1.3.85)。实际正交补 CCW90 后竖流收竖帧(几何对齐拍照模式正常路径),
-    // 横流仍走翻回正交原路径, 两类设备/两类流全兼容
+    // 1.3.87 回滚 1.3.86 双正交: 实际正交补 CCW90 会抵消手动旋转(竖显示流
+    // CW90+CCW90=0°, 设备实证"第一次点转没反应第二次 180°")。恢复翻回基准
+    // 单判定(1.3.32 语义: 显示角=m); 大幅裁剪写入绿屏改由 vcamTrimFractionalCrop
+    // 放宽预裁剪条件根治(见该函数)
     double srcRatio = (double)baseW / (double)baseH;
     double dstRatio = (double)targetW / (double)targetH;
-    double actualRatio = (double)srcW / (double)srcH;
-    BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0)
-                   || (actualRatio > 1.0 && dstRatio < 1.0) || (actualRatio < 1.0 && dstRatio > 1.0);
+    BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0);
     if (!orthogonal) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
