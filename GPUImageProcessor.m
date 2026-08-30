@@ -928,8 +928,10 @@ void vcamLaneResetAllMemos(void) {
         }
 
         // 1. 旋转/镜像（如果需要）→ BGRA
+        // 1.3.83: 去掉 VT rotation 前置条件(iOS 12 无该私有符号时原来整体跳过),
+        // rotateAndMirror 内部自回退 CPU 软件旋转
         CVPixelBufferRef processedBuffer = NULL;
-        if ((total != 0 || _mirrored) && _rotationApiAvailable && _pixelRotationSession) {
+        if (total != 0 || _mirrored) {
             processedBuffer = [self rotateAndMirror:input width:rotW height:rotH angle:total];
         }
         // 如果旋转失败或不需要旋转，直接用输入
@@ -1018,8 +1020,35 @@ void vcamLaneResetAllMemos(void) {
     return output;
 }
 
+// 前置声明(定义在本文件后部): CPU 旋转回退路径使用
+static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst);
+static void vcamMirrorRowsInPlace(CVPixelBufferRef pb);
+static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int angle);
+
 - (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height angle:(int)angle CF_RETURNS_RETAINED {
-    if (!input || !_pixelRotationSession) return NULL;
+    if (!input) return NULL;
+    // 1.3.83 CPU 回退: VT rotation 不可用(iOS 12 无该私有符号)时软件旋转 +
+    // 原地行反转镜像, 语义与 VT 路径一致(同格式输出, 角度 0 只镜像)
+    if (!_rotationApiAvailable || !_pixelRotationSession || !_transferRotationImage) {
+        OSType fmt = CVPixelBufferGetPixelFormatType(input);
+        CVPixelBufferRef dst = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, width, height, fmt, NULL, &dst) != noErr || !dst) {
+            return NULL;
+        }
+        BOOL ok;
+        if (angle != 0) {
+            ok = vcamRotateBufferCPU(input, dst, angle);
+        } else {
+            ok = vcamCopyPlanes(input, dst);
+        }
+        if (!ok) {
+            CVPixelBufferRelease(dst);
+            return NULL;
+        }
+        if (_mirrored) vcamMirrorRowsInPlace(dst);
+        return dst;
+    }
+    if (!_pixelRotationSession) return NULL;
 
     // 目标缓冲保持源格式（对齐千面 rotateBuffer: 0xe514-0xe578:
     // GetPixelFormatType(src) → CVPixelBufferCreate(同格式) —— 420f 源旋转后仍是 420f,
@@ -1113,6 +1142,122 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     }
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
+
+// CPU 软件旋转(1.3.83, iOS 12 回退): VTPixelRotationSessionCreate/RotateImage
+// 是 iOS 15/16 才有的符号, 老系统 dlsym 不到 → _rotationApiAvailable=NO →
+// 旋转整体直通("转"按钮点了个寂寞, 替换/镜像/缩放不受影响 —— 它们走的
+// VTPixelTransferSession 是 iOS 8+ 全有的老 API)。
+// 本函数逐平面旋转: 双平面 YUV(420f/420v: Y=1字节粒度, UV=2字节 CbCr 对
+// 粒度, 对不拆开)/单平面 BGRA(4字节粒度)。90/270 宽高互换, 180 原尺寸。
+// 映射: CW90 dst(dx,dy)=src(sx=dy, sy=ph-1-dx); CCW90 dst(dx,dy)=src(sx=pw-1-dy, sy=dx);
+//       180 dst(dx,dy)=src(pw-1-dx, ph-1-dy)。~1080p YUV 3~8ms, 预渲染 41ms
+// 预算内; 仅 VT rotation 不可用(老系统)时走此路径, 15/16 设备零影响。
+static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int angle) {
+    if (!src || !dst) return NO;
+    if (angle != 90 && angle != 180 && angle != 270) return NO;
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+    BOOL ok = YES;
+    int planes = (int)CVPixelBufferGetPlaneCount(src);
+    if (planes > 0 && planes == (int)CVPixelBufferGetPlaneCount(dst)) {
+        // 多平面(双平面 YUV): 每平面独立旋转(UV 半分辨率, 映射公式相同)
+        for (int p = 0; p < planes; p++) {
+            size_t px = (p == 0) ? 1 : 2;  // Y=1字节/单元, UV=2字节(CbCr 对)
+            size_t pw = CVPixelBufferGetWidthOfPlane(src, p);
+            size_t ph = CVPixelBufferGetHeightOfPlane(src, p);
+            uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, p);
+            uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, p);
+            size_t sbpr = CVPixelBufferGetBytesPerRowOfPlane(src, p);
+            size_t dbpr = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            if (!sb || !db || !pw || !ph) { ok = NO; continue; }
+            if (angle == 90 || angle == 270) {
+                if (CVPixelBufferGetWidthOfPlane(dst, p) != ph ||
+                    CVPixelBufferGetHeightOfPlane(dst, p) != pw) { ok = NO; continue; }
+            } else {
+                if (CVPixelBufferGetWidthOfPlane(dst, p) != pw ||
+                    CVPixelBufferGetHeightOfPlane(dst, p) != ph) { ok = NO; continue; }
+            }
+            if (angle == 180) {
+                for (size_t dy = 0; dy < ph; dy++) {
+                    uint8_t *drow = db + dy * dbpr;
+                    const uint8_t *srow = sb + (ph - 1 - dy) * sbpr;
+                    for (size_t dx = 0; dx < pw; dx++) {
+                        for (size_t b = 0; b < px; b++) {
+                            drow[dx * px + b] = srow[(pw - 1 - dx) * px + b];
+                        }
+                    }
+                }
+            } else if (angle == 90) {
+                // CW90: dst 平面 ph×pw; 行 dy ← src 列 dy 自底向上
+                for (size_t dy = 0; dy < pw; dy++) {
+                    uint8_t *drow = db + dy * dbpr;
+                    const uint8_t *sp = sb + (ph - 1) * sbpr + dy * px;
+                    for (size_t dx = 0; dx < ph; dx++) {
+                        for (size_t b = 0; b < px; b++) drow[dx * px + b] = sp[b];
+                        sp -= sbpr;
+                    }
+                }
+            } else {  // 270
+                // CCW90: dst 平面 ph×pw; 行 dy ← src 列 pw-1-dy 自顶向下
+                for (size_t dy = 0; dy < pw; dy++) {
+                    uint8_t *drow = db + dy * dbpr;
+                    const uint8_t *sp = sb + (pw - 1 - dy) * px;
+                    for (size_t dx = 0; dx < ph; dx++) {
+                        for (size_t b = 0; b < px; b++) drow[dx * px + b] = sp[b];
+                        sp += sbpr;
+                    }
+                }
+            }
+        }
+    } else if (planes <= 0 && CVPixelBufferGetPlaneCount(dst) <= 0) {
+        // 单平面(BGRA): 4 字节/像素
+        size_t px = 4;
+        size_t pw = CVPixelBufferGetWidth(src), ph = CVPixelBufferGetHeight(src);
+        uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        size_t sbpr = CVPixelBufferGetBytesPerRow(src);
+        size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
+        if (!sb || !db || !pw || !ph) {
+            ok = NO;
+        } else if ((angle == 90 || angle == 270) &&
+                   (CVPixelBufferGetWidth(dst) != ph || CVPixelBufferGetHeight(dst) != pw)) {
+            ok = NO;
+        } else if (angle == 180 &&
+                   (CVPixelBufferGetWidth(dst) != pw || CVPixelBufferGetHeight(dst) != ph)) {
+            ok = NO;
+        } else if (angle == 180) {
+            for (size_t dy = 0; dy < ph; dy++) {
+                uint32_t *drow = (uint32_t *)(db + dy * dbpr);
+                const uint32_t *srow = (const uint32_t *)(sb + (ph - 1 - dy) * sbpr);
+                for (size_t dx = 0; dx < pw; dx++) drow[dx] = srow[pw - 1 - dx];
+            }
+        } else if (angle == 90) {
+            for (size_t dy = 0; dy < pw; dy++) {
+                uint32_t *drow = (uint32_t *)(db + dy * dbpr);
+                const uint8_t *sp = sb + (ph - 1) * sbpr + dy * px;
+                for (size_t dx = 0; dx < ph; dx++) {
+                    drow[dx] = *(const uint32_t *)sp;
+                    sp -= sbpr;
+                }
+            }
+        } else {
+            for (size_t dy = 0; dy < pw; dy++) {
+                uint32_t *drow = (uint32_t *)(db + dy * dbpr);
+                const uint8_t *sp = sb + (pw - 1 - dy) * px;
+                for (size_t dx = 0; dx < ph; dx++) {
+                    drow[dx] = *(const uint32_t *)sp;
+                    sp += sbpr;
+                }
+            }
+        }
+    } else {
+        ok = NO;  // 源/目标平面结构不匹配
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return ok;
+}
+
 
 // 录像绿线修复教训(2026-08-19):
 // v1(已回滚): VT 写完后对相机 dst IOSurface 做 CPU lock + 边缘 UV 覆盖 ——
@@ -1250,6 +1395,34 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 if (rotFailLogged++ < 2) {
                     vcam_gpu_log([NSString stringWithFormat:@"[vcam] prerender rotate failed: %d (keep unrotated)", (int)st]);
                 }
+            }
+        }
+    }
+    // 1.3.83 CPU 旋转回退: VT rotation 不可用(iOS 12 无该私有符号)时软件旋转。
+    // 复用同一 3 槽几何池(与 VT 分支互斥, 不会双写); 槽 buffer 可写 →
+    // 阶段2 镜像原地行反转零额外拷贝。失败仍回退原帧(不旋转但不崩)
+    if (!work && needRotate) {
+        size_t rotW = (total == 90 || total == 270) ? inH : inW;
+        size_t rotH = (total == 90 || total == 270) ? inW : inH;
+        int slot = _prerenderRotateSlot;
+        _prerenderRotateSlot = (slot + 1) % 3;
+        CVPixelBufferRef dst = [self prerenderRotateBufferAtSlot:slot];
+        if (!dst || CVPixelBufferGetWidth(dst) != rotW || CVPixelBufferGetHeight(dst) != rotH ||
+            CVPixelBufferGetPixelFormatType(dst) != fmt) {
+            if (dst) CVPixelBufferRelease(dst);
+            dst = NULL;
+            if (CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH, fmt, NULL, &dst) == noErr && dst) {
+                [self setPrerenderRotateBuffer:dst atSlot:slot];  // 所有权转移给池
+            } else {
+                [self setPrerenderRotateBuffer:NULL atSlot:slot];
+            }
+        }
+        if (dst && vcamRotateBufferCPU(input, dst, total)) {
+            work = CVPixelBufferRetain(dst);
+            workIsWritable = YES;
+            static int cpuRotLogged = 0;
+            if (cpuRotLogged++ < 2) {
+                vcam_gpu_log(@"[vcam] CPU rotation fallback in use (VT rotation unavailable, e.g. iOS 12)");
             }
         }
     }
