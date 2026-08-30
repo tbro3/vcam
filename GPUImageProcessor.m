@@ -1077,8 +1077,20 @@ static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int 
 
     status = _transferRotationImage(_pixelRotationSession, input, dst);
     if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelRotationSession failed: %d", (int)status]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelRotationSession failed: %d, falling back to CPU rotation", (int)status]);
         CVPixelBufferRelease(dst);
+        // 1.3.84 CPU 兜底: VT rotate 运行时失败(个别越狱环境符号 rebind/session
+        // 异常)不再直通原帧 —— 软件旋转保住"转"按钮语义
+        dst = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat, NULL, &dst) == noErr && dst) {
+            BOOL ok = (angle != 0) ? vcamRotateBufferCPU(input, dst, angle)
+                                   : vcamCopyPlanes(input, dst);
+            if (ok) {
+                if (_mirrored) vcamMirrorRowsInPlace(dst);
+                return dst;
+            }
+            CVPixelBufferRelease(dst);
+        }
         return NULL;
     }
 
