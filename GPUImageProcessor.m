@@ -1024,6 +1024,7 @@ void vcamLaneResetAllMemos(void) {
 static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst);
 static void vcamMirrorRowsInPlace(CVPixelBufferRef pb);
 static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int angle);
+static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst);
 
 - (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height angle:(int)angle CF_RETURNS_RETAINED {
     if (!input) return NULL;
@@ -1046,6 +1047,7 @@ static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int 
             return NULL;
         }
         if (_mirrored) vcamMirrorRowsInPlace(dst);
+        vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 buffer 附件同步
         return dst;
     }
     if (!_pixelRotationSession) return NULL;
@@ -1087,6 +1089,7 @@ static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int 
                                    : vcamCopyPlanes(input, dst);
             if (ok) {
                 if (_mirrored) vcamMirrorRowsInPlace(dst);
+                vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 buffer 附件同步
                 return dst;
             }
             CVPixelBufferRelease(dst);
@@ -1094,6 +1097,7 @@ static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int 
         return NULL;
     }
 
+    vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 rotation buffer 附件同步
     return dst;
 }
 
@@ -1441,6 +1445,13 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (!work) {
         work = (CVPixelBufferRef)CVPixelBufferRetain(input);  // 解码器 buffer, 不可写
     }
+    // 1.3.85 绿屏修复: 旋转池 buffer 是 CVPixelBufferCreate 裸建(无色彩附件)。
+    // 设备实证(iPhone13/iOS15 rootless, 视频模式点转): 无附件 420f 源 → p420
+    // 私有格式 YUV 直转被 VT 拒绝 → lazy BGRA 回退路径产出 UV=0 坏帧 → 全屏绿。
+    // 解码帧附件带 range/矩阵, 同步后直转恢复(与 bakeUserTransform 同款修复)
+    if (work != input) {
+        vcamSyncColorAttachments(input, work);
+    }
 
     // 阶段2: 镜像(CPU 行反转)
     if (!needMirror) return work;  // CF_RETURNS_RETAINED
@@ -1470,6 +1481,8 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
     if (mb && vcamCopyPlanes(work, mb)) {
         vcamMirrorRowsInPlace(mb);
+        // 1.3.85: mirror-copy 出的槽 buffer 同样裸建, 附件同步(同上)
+        vcamSyncColorAttachments(work, mb);
         CVPixelBufferRelease(work);
         return CVPixelBufferRetain(mb);
     }
@@ -2090,6 +2103,9 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         CVPixelBufferRelease(rotated);
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
+    // 1.3.85 绿屏修复: CCW90 缓存 buffer 裸建无色彩附件, 同步源帧附件
+    // (无附件 420f → p420 私有格式直转被拒 → lazy BGRA 坏帧绿屏, 同 prerender 修复)
+    vcamSyncColorAttachments(src, rotated);
     return rotated;  // CF_RETURNS_RETAINED
 }
 
