@@ -1413,6 +1413,10 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (outSlot) *outSlot = 0;
     VcamUICreateScreenImageFn capFn = vcamUICreateScreenImage();
     if (!capFn) return 0;
+    // 1.3.89 崩溃根修(2026-09-01 相机 4 连崩实证): UICreateScreenImage 内部
+    // __CFDictionaryCreateGeneric 可抛 ObjC 异常; SB 端未捕获 = SpringBoard
+    // 崩溃 → respring 循环。本拍失败返回 0(无色), 看门狗/滑窗天然容忍。
+    @try {
     CGImageRef full = capFn();
     if (!full) return 0;
 
@@ -1451,6 +1455,10 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
     CFRelease(full);
     return detected;
+    } @catch (NSException *e) {
+        // 兜底: UICSI 内部异常本拍按无色处理, 绝不冒泡进 SB 运行时
+        return 0;
+    }
 }
 
 // 检测一拍(1.3.39 看门狗架构):
