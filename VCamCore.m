@@ -16,7 +16,7 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
-#include <libproc.h>
+#include <sys/resource.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <fcntl.h>
@@ -42,12 +42,14 @@ extern void vcamLaneResetAllMemos(void);
 // -14% 负差分), "负差分只推进时间基线"的旧修法又让后续样本被还债式低估。
 // 毛刺+低估双重噪声把 EMA 反复推过 110 线 → hardTrip 5 分钟 11 次开关
 // (2026-08-30 日志实证) = 24↔20fps 周期横跳 = "打开一段时间后卡顿掉帧不稳定"
-// 直接来源。改 proc_pidinfo(PROC_PIDTASKINFO) 进程级单调累计(pti_total_user
-// +pti_total_system, 内核记账, 线程启停零影响), 差分即真实 CPU%。
+// 直接来源。改 getrusage(RUSAGE_SELF): POSIX 公开 API, 内核维护的进程级
+// 单调 CPU 总计(user+system, 含已退出线程, µs 精度), 线程启停零影响,
+// 差分即真实 CPU%(libproc.h 不随 iPhoneOS SDK 发布, 私有头弃用)。
 static double vcam_process_cpu_seconds(void) {
-    struct proc_taskinfo pti;
-    if (proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &pti, sizeof(pti)) == (int)sizeof(pti)) {
-        return (double)(pti.pti_total_user + pti.pti_total_system) / 1000000000.0;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1000000.0
+             + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1000000.0;
     }
     return -1.0;  // 采样失败: 调用方按无效样本丢弃(不更新基线)
 }
@@ -850,8 +852,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     // 线程退出让累计时间凭空消失(负差分), "负差分只推进时间基线"的旧修法让
     // 后续样本被还债式低估 —— 毛刺+低估双重噪声把 EMA 反复推过 110 线 →
     // hardTrip 5 分钟 11 次开关(2026-08-30 日志实证) = 24↔20fps 横跳卡顿。
-    // 1.3.88: 采样改 proc_pidinfo 单调口径 + hardTrip 两级判定(>170 立即压;
-    // 110-170 需连续越线 ≥8s 才压), 双保险根治振荡。
+    // 1.3.88: 采样改 getrusage(RUSAGE_SELF) 单调口径 + hardTrip 两级判定
+    // (>170 立即压; 110-170 需连续越线 ≥8s 才压), 双保险根治振荡。
     // 滞回时间窗: 进入后 ≥5s 不许退出, 退出后 ≥8s 不许再进 —— 防高频振荡
         // 紧急档重构(2026-08-17 横跳根治): 旧 46/48 阈值在正常运行区(实测 45-58%)
         // 内部横跳 → 内容 24↔20fps 反复切换 = 卡顿本身。教训: 系统配额是
