@@ -519,6 +519,10 @@ static void *vcamSymTrusted(void *p) {
     return NULL;
 }
 
+#if 0  // 1.3.90: SecKey 验签链路已移除(改自含 ECDSA), 三个 Sec 符号解析
+       // 辅助停用留档 —— 防破解审计结论: SecKeyVerifySignature 入口指令可被
+       // 越狱框架内联 Hook 恒返 YES, 是旧链路最大攻击面(详见 vcamEcdsaVerify)。
+
 // Security.framework 显式加载(1.3.57): SB/mediaserverd 主程序不直接链接
 // Security, RTLD_DEFAULT 搜索域里没有该镜像 → 全部 Sec 符号落空
 // ("sec syms missing", 1.3.56 激活失败根因: MGCopyAnswer/IOKit 在 SB 已加载
@@ -596,6 +600,7 @@ static void *vcamSecSymX(void *img, const char *name, int *diag) {
     *diag = 0;
     return NULL;
 }
+#endif  // 1.3.90 SecKey 链路留档结束
 
 // SHA256(源) 前 8 字节 → 16 位大写 hex NSString(设备码口径, 展示分组由 UI 做)
 typedef unsigned char *(*vcamSHA256Fn)(const void *, unsigned int, unsigned char *);
@@ -733,6 +738,335 @@ static NSString *vcamPlatformSerial(void) {
     return code;
 }
 
+// ===== 1.3.90 自含 ECDSA P-256 验签(防 SecKeyVerifySignature 内联 Hook) =====
+// 动机(2026-09-01 防破解审计): 旧链路 SecKeyVerifySignature 的函数指针即使
+// 解析自可信镜像(/System), 该函数【入口指令】仍可被越狱 hook 框架内联补丁
+// (MSHookFunction 改头跳板) → 恒返 YES → 伪造任意 blob 验签全过 —— IMP 范围
+// 自检只覆盖本 dylib 的方法, 管不到 Security.framework 的代码页。本实现把
+// P-256 验签全部数学(u256 乘法/二进制长除规约/Fermat 求逆/Jacobian 点运算/
+// DER 解析)搬进本 dylib, 除 CC_SHA256 摘要外零外部调用(摘要非信任锚点:
+// hook 它只能让验签失败, 无法伪造) → 本段代码受 __TEXT 磁盘+内存双口径哈希
+// 保护, hook 它 = 改它 = 哈希失配关门禁。
+// 性能: Shamir 双标量 256 轮 ≈ 4.3k 次 mul_mod_p, 二进制长除规约 ~3μs/次
+// → 单次验签 ~14ms; vcamLicenseValid 缓存 0.5→2s → <0.8% 单核(轮询线程,
+// 不碰渲染)。常数 = SEC2 P-256 标准参数(已用本地私钥签名离线验证 30/30 +
+// 篡改全拒 + 高位 r/s 边界通过, 密钥/verify_ecdsa_plan.py)。
+// 载荷格式与 gen_license.py 严格一致: blob v2 = base64(DER).base64(T_enc)。
+
+typedef struct { uint64_t v[4]; } vcam_u256;  // 小端 4×64bit limbs
+
+static const vcam_u256 vP256_P = {{   // p = 2^256-2^224+2^192+2^96-1
+    0xFFFFFFFFFFFFFFFFull, 0x00000000FFFFFFFFull,
+    0x0000000000000000ull, 0xFFFFFFFF00000001ull }};
+static const vcam_u256 vP256_N = {{   // 曲线阶 n
+    0xF3B9CAC2FC632551ull, 0xBCE6FAADA7179E84ull,
+    0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFF00000000ull }};
+static const vcam_u256 vP256_Nm2 = {{ // n-2(Fermat 求逆指数)
+    0xF3B9CAC2FC63254Full, 0xBCE6FAADA7179E84ull,
+    0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFF00000000ull }};
+static const vcam_u256 vP256_Pm2 = {{ // p-2(Z 逆元指数)
+    0xFFFFFFFFFFFFFFFDull, 0x00000000FFFFFFFFull,
+    0x0000000000000000ull, 0xFFFFFFFF00000001ull }};
+static const vcam_u256 vP256_B = {{   // 曲线 b
+    0x3BCE3C3E27D2604Bull, 0x651D06B0CC53B0F6ull,
+    0xB3EBBD55769886BCull, 0x5AC635D8AA3A93E7ull }};
+static const vcam_u256 vP256_GX = {{
+    0xF4A13945D898C296ull, 0x77037D812DEB33A0ull,
+    0xF8BCE6E563A440F2ull, 0x6B17D1F2E12C4247ull }};
+static const vcam_u256 vP256_GY = {{
+    0xCBB6406837BF51F5ull, 0x2BCE33576B315ECEull,
+    0x8EE7EB4A7C0F9E16ull, 0x4FE342E2FE1A7F9Bull }};
+
+static BOOL vu_is_zero(const vcam_u256 *a) {
+    return (a->v[0] | a->v[1] | a->v[2] | a->v[3]) == 0;
+}
+static BOOL vu_ge(const vcam_u256 *a, const vcam_u256 *b) {
+    for (int i = 3; i >= 0; i--) {
+        if (a->v[i] != b->v[i]) return a->v[i] > b->v[i];
+    }
+    return YES;
+}
+static void vu_copy(vcam_u256 *r, const vcam_u256 *a) {
+    memcpy(r->v, a->v, sizeof(a->v));
+}
+// 大端字节串 → u256(右对齐, len ≤ 32)
+static BOOL vu_from_be(vcam_u256 *r, const uint8_t *be, size_t len) {
+    memset(r->v, 0, sizeof(r->v));
+    if (len == 0 || len > 32) return NO;
+    for (size_t k = 0; k < len; k++) {
+        r->v[k >> 3] |= (uint64_t)be[len - 1 - k] << ((k & 7) * 8);
+    }
+    return YES;
+}
+// 借位减法 r -= m(小端 4 limbs), 借位丢弃(调用方保证语义)
+static void vu_sub_eq(vcam_u256 *r, const vcam_u256 *m) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t av = r->v[i], mv = m->v[i];
+        uint64_t t = av - mv;
+        uint64_t b1 = (av < mv) ? 1u : 0u;
+        uint64_t t2 = t - borrow;
+        uint64_t b2 = (t < borrow) ? 1u : 0u;
+        borrow = b1 | b2;
+        r->v[i] = t2;
+    }
+}
+// r = a + b mod p(要求 a,b < p)
+static void vu_add_p(vcam_u256 *r, const vcam_u256 *a, const vcam_u256 *b) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 t = (unsigned __int128)a->v[i] + b->v[i] + carry;
+        r->v[i] = (uint64_t)t;
+        carry = (uint64_t)(t >> 64);
+    }
+    if (carry || vu_ge(r, &vP256_P)) vu_sub_eq(r, &vP256_P);
+}
+// r = a - b mod p(要求 a,b < p)
+static void vu_sub_p(vcam_u256 *r, const vcam_u256 *a, const vcam_u256 *b) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t av = a->v[i], mv = b->v[i];
+        uint64_t t = av - mv;
+        uint64_t b1 = (av < mv) ? 1u : 0u;
+        uint64_t t2 = t - borrow;
+        uint64_t b2 = (t < borrow) ? 1u : 0u;
+        borrow = b1 | b2;
+        r->v[i] = t2;
+    }
+    if (borrow) {
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; i++) {
+            unsigned __int128 t = (unsigned __int128)r->v[i] + vP256_P.v[i] + carry;
+            r->v[i] = (uint64_t)t;
+            carry = (uint64_t)(t >> 64);
+        }
+    }
+}
+// out[8] = a*b(512bit 小端 limbs)
+static void vu_mul512(uint64_t *out, const vcam_u256 *a, const vcam_u256 *b) {
+    for (int i = 0; i < 8; i++) out[i] = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 carry = 0;
+        for (int j = 0; j < 4; j++) {
+            unsigned __int128 t = (unsigned __int128)a->v[i] * b->v[j]
+                                  + out[i + j] + (uint64_t)carry;
+            out[i + j] = (uint64_t)t;
+            carry = t >> 64;
+        }
+        int k = i + 4;
+        uint64_t c = (uint64_t)carry;
+        while (c && k < 8) {
+            uint64_t t = out[k] + c;
+            out[k] = t;
+            c = (t < c) ? 1u : 0u;
+            k++;
+        }
+    }
+}
+// r = x mod m(x: 512bit 小端被破坏; m: ≥2^255 奇素数)
+// 二进制长除: 逐位移入 5-limb 余数, ≥m 即减 —— 移位后余数 < 2m ≤ 2^257,
+// rem[4] ∈ {0,1}, 一次减法必回 < m(不变式保持)
+static void vu_mod512(uint64_t *x, const vcam_u256 *m, vcam_u256 *r) {
+    uint64_t rem[5] = {0, 0, 0, 0, 0};
+    for (int bit = 511; bit >= 0; bit--) {
+        uint64_t carry = (x[bit >> 6] >> (bit & 63)) & 1u;
+        for (int i = 0; i < 5; i++) {
+            uint64_t nc = rem[i] >> 63;
+            rem[i] = (rem[i] << 1) | carry;
+            carry = nc;
+        }
+        BOOL ge = rem[4] ? YES : vu_ge((const vcam_u256 *)rem, m);
+        if (ge) {
+            vu_sub_eq((vcam_u256 *)rem, m);
+            rem[4] = 0;
+        }
+    }
+    vu_copy(r, (const vcam_u256 *)rem);
+}
+static void vu_mul_p(vcam_u256 *r, const vcam_u256 *a, const vcam_u256 *b) {
+    uint64_t t[8];
+    vu_mul512(t, a, b);
+    vu_mod512(t, &vP256_P, r);
+}
+static void vu_mul_n(vcam_u256 *r, const vcam_u256 *a, const vcam_u256 *b) {
+    uint64_t t[8];
+    vu_mul512(t, a, b);
+    vu_mod512(t, &vP256_N, r);
+}
+// r = a^e mod m(固定指数 e = p-2 或 n-2, 平方-乘从高位到低位)
+static void vu_pow_fixed(const vcam_u256 *a, const vcam_u256 *e,
+                         BOOL modP, vcam_u256 *r) {
+    vcam_u256 base, acc;
+    vu_copy(&base, a);
+    acc.v[0] = 1; acc.v[1] = 0; acc.v[2] = 0; acc.v[3] = 0;
+    for (int i = 255; i >= 0; i--) {
+        if (modP) vu_mul_p(&acc, &acc, &acc);
+        else      vu_mul_n(&acc, &acc, &acc);
+        if ((e->v[i >> 6] >> (i & 63)) & 1u) {
+            if (modP) vu_mul_p(&acc, &acc, &base);
+            else      vu_mul_n(&acc, &acc, &base);
+        }
+    }
+    vu_copy(r, &acc);
+}
+
+// Jacobian 点(x,y) = (X/Z², Y/Z³); Z=0 → 无穷远点
+typedef struct { vcam_u256 X, Y, Z; } vcam_pt;
+
+static void vpt_inf(vcam_pt *p) {
+    p->X.v[0] = 1; p->X.v[1] = 0; p->X.v[2] = 0; p->X.v[3] = 0;
+    p->Y.v[0] = 1; p->Y.v[1] = 0; p->Y.v[2] = 0; p->Y.v[3] = 0;
+    memset(p->Z.v, 0, sizeof(p->Z.v));
+}
+static BOOL vpt_is_inf(const vcam_pt *p) { return vu_is_zero(&p->Z); }
+// r = 2·p(教科书 Jacobian 倍点, a=-3; 全部计算后才写回 → 别名安全)
+static void vpt_dbl(vcam_pt *r, const vcam_pt *p) {
+    if (vpt_is_inf(p)) { vpt_inf(r); return; }
+    vcam_u256 yy, s, m, zz, zz4, t, x3, y4, yfin, z2;
+    vu_mul_p(&yy, &p->Y, &p->Y);                 // YY = Y²
+    vu_mul_p(&s, &p->X, &yy);                    // S  = X·Y²
+    vu_add_p(&s, &s, &s); vu_add_p(&s, &s, &s);  // S  = 4XY²
+    vu_mul_p(&zz, &p->Z, &p->Z);                 // Z²
+    vu_mul_p(&zz4, &zz, &zz);                    // Z⁴
+    vu_mul_p(&m, &p->X, &p->X);                  // X²
+    vu_sub_p(&m, &m, &zz4);                      // X²−Z⁴
+    vu_add_p(&t, &m, &m); vu_add_p(&m, &t, &m);  // M = 3(X²−Z⁴)
+    vu_mul_p(&x3, &m, &m);                       // M²
+    vu_sub_p(&x3, &x3, &s); vu_sub_p(&x3, &x3, &s);  // X' = M²−2S
+    vu_sub_p(&t, &s, &x3);                       // S−X'
+    vu_mul_p(&t, &t, &m);                        // M(S−X')
+    vu_mul_p(&y4, &yy, &yy);                     // Y⁴
+    vu_add_p(&y4, &y4, &y4); vu_add_p(&y4, &y4, &y4);
+    vu_add_p(&y4, &y4, &y4);                     // 8Y⁴
+    vu_sub_p(&yfin, &t, &y4);                    // Y' = M(S−X')−8Y⁴
+    vu_mul_p(&z2, &p->Y, &p->Z);
+    vu_add_p(&z2, &z2, &z2);                     // Z' = 2YZ
+    vu_copy(&r->X, &x3); vu_copy(&r->Y, &yfin); vu_copy(&r->Z, &z2);
+}
+// r = p + q(Jacobian 全加, 别名安全; H=0 时退化为倍点/无穷远点)
+static void vpt_add(vcam_pt *r, const vcam_pt *p, const vcam_pt *q) {
+    if (vpt_is_inf(p)) { memcpy(r, q, sizeof(*r)); return; }
+    if (vpt_is_inf(q)) { memcpy(r, p, sizeof(*r)); return; }
+    vcam_u256 z1z1, z2z2, u1, u2, s1, s2, h, rr, h2, h3, u1h2, t, xnew, ynew, znew;
+    vu_mul_p(&z1z1, &p->Z, &p->Z);
+    vu_mul_p(&z2z2, &q->Z, &q->Z);
+    vu_mul_p(&u1, &p->X, &z2z2);                 // U1 = X1·Z2²
+    vu_mul_p(&u2, &q->X, &z1z1);                 // U2 = X2·Z1²
+    vu_mul_p(&s1, &p->Y, &q->Z); vu_mul_p(&s1, &s1, &z2z2);  // S1 = Y1·Z2³
+    vu_mul_p(&s2, &q->Y, &p->Z); vu_mul_p(&s2, &s2, &z1z1); // S2 = Y2·Z1³
+    vu_sub_p(&h, &u2, &u1);                      // H = U2−U1
+    vu_sub_p(&rr, &s2, &s1);                     // R = S2−S1
+    if (vu_is_zero(&h)) {
+        if (vu_is_zero(&rr)) { vpt_dbl(r, p); return; }
+        vpt_inf(r); return;
+    }
+    vu_mul_p(&h2, &h, &h);
+    vu_mul_p(&h3, &h2, &h);
+    vu_mul_p(&u1h2, &u1, &h2);
+    vu_mul_p(&t, &rr, &rr);
+    vu_sub_p(&t, &t, &h3);
+    vu_sub_p(&t, &t, &u1h2); vu_sub_p(&t, &t, &u1h2);   // X' = R²−H³−2U1H²
+    vu_copy(&xnew, &t);
+    vu_sub_p(&t, &u1h2, &xnew);
+    vu_mul_p(&t, &t, &rr);
+    vu_mul_p(&s1, &s1, &h3);
+    vu_sub_p(&ynew, &t, &s1);                    // Y' = R(U1H²−X')−S1H³
+    vu_mul_p(&znew, &p->Z, &q->Z);
+    vu_mul_p(&znew, &znew, &h);                  // Z' = H·Z1·Z2
+    vu_copy(&r->X, &xnew); vu_copy(&r->Y, &ynew); vu_copy(&r->Z, &znew);
+}
+// R = k1·Q1 + k2·Q2(Shamir 4 点表; 标量 < n)
+static void vpt_mul2(vcam_pt *R, const vcam_u256 *k1, const vcam_pt *Q1,
+                     const vcam_u256 *k2, const vcam_pt *Q2) {
+    vcam_pt T[4];
+    vpt_inf(&T[0]);
+    memcpy(&T[1], Q1, sizeof(vcam_pt));
+    memcpy(&T[2], Q2, sizeof(vcam_pt));
+    memcpy(&T[3], Q1, sizeof(vcam_pt));
+    vpt_add(&T[3], Q1, Q2);
+    vpt_inf(R);
+    for (int i = 255; i >= 0; i--) {
+        vpt_dbl(R, R);
+        int b1 = (int)((k1->v[i >> 6] >> (i & 63)) & 1u);
+        int b2 = (int)((k2->v[i >> 6] >> (i & 63)) & 1u);
+        int idx = (b1 << 1) | b2;
+        if (idx) vpt_add(R, R, &T[idx]);
+    }
+}
+// 仿射 x mod n(x < p < 2n → 一次条件减)
+static BOOL vpt_x_modn(const vcam_pt *P, vcam_u256 *out) {
+    if (vpt_is_inf(P)) return NO;
+    vcam_u256 zinv, zinv2, x;
+    vu_pow_fixed(&P->Z, &vP256_Pm2, YES, &zinv);  // Z⁻¹ mod p
+    vu_mul_p(&zinv2, &zinv, &zinv);
+    vu_mul_p(&x, &P->X, &zinv2);                  // X/Z²
+    vu_copy(out, &x);
+    if (vu_ge(out, &vP256_N)) vu_sub_eq(out, &vP256_N);
+    return YES;
+}
+// 点在曲线上: y² == x³−3x+b (mod p)
+static BOOL vpt_on_curve(const vcam_u256 *x, const vcam_u256 *y) {
+    vcam_u256 lhs, rhs, t;
+    vu_mul_p(&lhs, y, y);
+    vu_mul_p(&rhs, x, x); vu_mul_p(&rhs, &rhs, x);
+    vu_add_p(&t, x, x); vu_add_p(&t, &t, x);      // 3x
+    vu_sub_p(&rhs, &rhs, &t);
+    vu_add_p(&rhs, &rhs, &vP256_B);
+    return memcmp(lhs.v, rhs.v, sizeof(lhs.v)) == 0;
+}
+// DER(X9.62) 签名解析: SEQUENCE{ INTEGER r, INTEGER s }(整段精确匹配防尾随垃圾)
+static BOOL v_parse_der_sig(const uint8_t *d, size_t len,
+                            vcam_u256 *r, vcam_u256 *s) {
+    size_t i = 0;
+    if (len < 8 || len > 72) return NO;
+    if (d[i++] != 0x30) return NO;
+    uint8_t seqlen = d[i++];
+    if ((size_t)seqlen + 2 != len) return NO;
+    if (d[i++] != 0x02) return NO;
+    uint8_t rlen = d[i++];
+    if (rlen == 0 || rlen > 33 || i + rlen > len) return NO;
+    const uint8_t *rp = d + i;
+    size_t rl = rlen;
+    while (rl > 0 && rp[0] == 0) { rp++; rl--; }  // 剥前导零(高位签名时 rlen=33)
+    if (rl == 0 || rl > 32) return NO;
+    if (!vu_from_be(r, rp, rl)) return NO;
+    i += rlen;
+    if (i + 2 > len || d[i++] != 0x02) return NO;
+    uint8_t slen = d[i++];
+    if (slen == 0 || slen > 33 || i + slen > len) return NO;
+    const uint8_t *sp = d + i;
+    size_t sl = slen;
+    while (sl > 0 && sp[0] == 0) { sp++; sl--; }
+    if (sl == 0 || sl > 32) return NO;
+    if (!vu_from_be(s, sp, sl)) return NO;
+    i += slen;
+    return i == len;
+}
+// 自含 ECDSA P-256/SHA-256 验签(msgHash 已是 SHA256 摘要)
+static BOOL vcamEcdsaVerify(const uint8_t msgHash[32],
+                            const uint8_t *der, size_t derLen,
+                            const vcam_u256 *qx, const vcam_u256 *qy) {
+    vcam_u256 r, s;
+    if (!v_parse_der_sig(der, derLen, &r, &s)) return NO;
+    if (vu_is_zero(&r) || vu_is_zero(&s)) return NO;
+    if (vu_ge(&r, &vP256_N) || vu_ge(&s, &vP256_N)) return NO;
+    if (!vpt_on_curve(qx, qy)) return NO;        // 公钥点合法性(常数自检/防呆)
+    vcam_u256 w, u1, u2, e;
+    vu_pow_fixed(&s, &vP256_Nm2, NO, &w);        // w = s⁻¹ mod n
+    vu_from_be(&e, msgHash, 32);
+    vu_mul_n(&u1, &e, &w);
+    vu_mul_n(&u2, &r, &w);
+    vcam_pt Q, G, R;
+    vu_copy(&Q.X, qx); vu_copy(&Q.Y, qy);
+    memset(Q.Z.v, 0, sizeof(Q.Z.v)); Q.Z.v[0] = 1;
+    vu_copy(&G.X, &vP256_GX); vu_copy(&G.Y, &vP256_GY);
+    memset(G.Z.v, 0, sizeof(G.Z.v)); G.Z.v[0] = 1;
+    vpt_mul2(&R, &u1, &G, &u2, &Q);              // R = u1·G + u2·Q
+    vcam_u256 v;
+    if (!vpt_x_modn(&R, &v)) return NO;
+    return memcmp(v.v, r.v, sizeof(v.v)) == 0;
+}
+
 // ==== ECDSA P-256 验签(全 dlsym, 符号不进符号表) ====
 // 消息 = 本机设备码原文(16 hex 大写); 签名 = base64(DER x9.62) blob(~96 字符)。
 // (1.3.60: iOS 的 kSecKeyAlgorithmECDSASignatureMessageX962SHA256 要求 DER
@@ -768,105 +1102,63 @@ static NSString *vcamPlatformSerial(void) {
     [msg appendData:tEnc];
     NSData *msgData = [msg copy];
 
-    typedef CFTypeRef (*SecKeyCreateWithDataFn)(CFDataRef, CFDictionaryRef, void **);
-    typedef BOOL (*SecKeyVerifySignatureFn)(CFTypeRef, CFStringRef, CFDataRef, CFDataRef, void **);
-    static SecKeyCreateWithDataFn createKey = NULL;
-    static SecKeyVerifySignatureFn verifySig = NULL;
-    static CFStringRef attrType = NULL, attrClass = NULL, attrSize = NULL;
-    static CFStringRef keyTypeEC = NULL, keyClassPub = NULL, sigAlg = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        void *img = vcamSecImg();
-        int dg[8];
-        createKey  = (SecKeyCreateWithDataFn)vcamSecSymX(img, "SecKeyCreateWithData", &dg[0]);
-        verifySig  = (SecKeyVerifySignatureFn)vcamSecSymX(img, "SecKeyVerifySignature", &dg[1]);
-        // kSecAttr*/kSecKeyAlgorithm* 是 const CFStringRef 指针常量: dlsym 返回的是
-        // "存放该指针的变量"的地址, 须再解一层引用(*slot)取真正的 CFStringRef 值。
-        // (1.3.55 激活失败设备端根因: 直接把符号地址当 CFStringRef 用 → 属性
-        //  字典键全错 → SecKeyCreateWithData 建钥失败 → 验签永远 NO)
-        CFStringRef *slot = NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyType", &dg[2]);
-        attrType  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyClass", &dg[3]);
-        attrClass = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeySizeInBits", &dg[4]);
-        attrSize  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyTypeECSECPrimeRandom", &dg[5]);
-        keyTypeEC = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyClassPublic", &dg[6]);
-        keyClassPub = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecKeyAlgorithmECDSASignatureMessageX962SHA256", &dg[7]);
-        sigAlg    = slot ? *slot : NULL;
-        // 单行诊断: img=句柄, d=8 符号各自 0/1/2 (见 vcamSecSymX)
-        vcam_notify_log([NSString stringWithFormat:
-            @"[vcam][lic] sec diag img=%d d=%d%d%d%d%d%d%d%d", img != NULL,
-            dg[0], dg[1], dg[2], dg[3], dg[4], dg[5], dg[6], dg[7]]);
-        if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
-            !keyTypeEC || !keyClassPub || !sigAlg) {
-            vcam_notify_log(@"[vcam][lic] sec syms missing");
-        }
-    });
-    if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
-        !keyTypeEC || !keyClassPub || !sigAlg) return NO;
-
-    // 公钥 hex → 65 字节未压缩点(静态缓存)
-    static NSData *pubKeyData = nil;
+    // 1.3.90 验签核心切换: SecKeyVerifySignature(入口指令可被内联 Hook 恒返
+    // YES, 见上方自含实现注释) → vcamEcdsaVerify(本 dylib 内全部数学, 受
+    // __TEXT 双口径哈希保护)。公钥 hex → (x, y) 一次性解析(静态缓存)。
+    static vcam_u256 pubX, pubY;
+    static BOOL pubParsed = NO;
     static dispatch_once_t pubOnce;
     dispatch_once(&pubOnce, ^{
         NSString *pubHex = @"047ac82d0d8ba9e315bebf8ebdb1c6a8065b4156f9a5839fd2ba92082081a10fa67972526b49606266b25d87911b5b707838390d4ce3eef81039e986da6cd58cd6";
         if ([pubHex length] != 130) return;
         const char *hex = [pubHex UTF8String];
-        NSMutableData *d = [NSMutableData dataWithLength:65];
-        uint8_t *b = (uint8_t *)d.mutableBytes;
+        uint8_t b[65];
         for (int i = 0; i < 65; i++) {
             int hi = vcamHexDigit(hex[i * 2]);
             int lo = vcamHexDigit(hex[i * 2 + 1]);
             if (hi < 0 || lo < 0) return;
             b[i] = (uint8_t)((hi << 4) | lo);
         }
-        pubKeyData = [d copy];
+        if (b[0] != 0x04) return;  // X9.63 未压缩点前缀
+        pubParsed = vu_from_be(&pubX, b + 1, 32) && vu_from_be(&pubY, b + 33, 32);
     });
-    // 1.3.61 验签链路逐环诊断(每进程一次): 1.3.60 设备实测 d=22222222
-    // (8 符号全解出)后仍无 state change → 失败点在符号解析之后的静默
-    // return。pub=公钥字节数(65 正常, 0=hex 解码失败) key=SecKey 建钥
-    // 结果 sig=验签结果 bl/sl=blob 字符数与 DER 字节数
+    if (!pubParsed) return NO;
+
+    // e = SHA256(设备码 || T_enc) —— 摘要经可信解析的 CC_SHA256(摘要非信任
+    // 锚点: hook 它只能令验签失败, 无法伪造签名)
+    static vcamSHA256Fn sha = NULL;
+    static dispatch_once_t shaOnce;
+    dispatch_once(&shaOnce, ^{
+        sha = (vcamSHA256Fn)vcamDlsymTrusted("CC_SHA256");
+    });
+    if (!sha) return NO;
+    uint8_t e[32];
+    sha(msgData.bytes, (unsigned int)msgData.length, e);
+
+    BOOL sigOK = vcamEcdsaVerify(e, sig.bytes, sig.length, &pubX, &pubY);
+    // 验签链路诊断(每进程一次): gc=G 点在曲线(常数自检), pq=公钥点在曲线,
+    // sig=验签结果, bl/sl=blob 与 DER 字节数
     static dispatch_once_t verDiagOnce;
-    BOOL keyOK = NO, sigOK = NO;
-    if (pubKeyData.length == 65) {
-        int bits = 256;
-        CFNumberRef sizeNum = CFNumberCreate(NULL, kCFNumberIntType, &bits);
-        const void *dk[3] = { attrType, attrClass, attrSize };
-        const void *dv[3] = { keyTypeEC, keyClassPub, sizeNum };
-        CFDictionaryRef attrs = CFDictionaryCreate(NULL, dk, dv, 3,
-            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFTypeRef key = attrs ? createKey((__bridge CFDataRef)pubKeyData, attrs, NULL) : NULL;
-        if (attrs) CFRelease(attrs);
-        if (sizeNum) CFRelease(sizeNum);
-        keyOK = key != NULL;
-        if (key) {
-            sigOK = verifySig(key, sigAlg,
-                              (__bridge CFDataRef)msgData, (__bridge CFDataRef)sig, NULL);
-            CFRelease(key);
-        }
-    }
     dispatch_once(&verDiagOnce, ^{
         vcam_notify_log([NSString stringWithFormat:
-            @"[vcam][lic] ver diag pub=%lu key=%d sig=%d bl=%lu sl=%lu",
-            (unsigned long)pubKeyData.length, keyOK, sigOK,
+            @"[vcam][lic] ver diag(own) gc=%d pq=%d sig=%d bl=%lu sl=%lu",
+            vpt_on_curve(&vP256_GX, &vP256_GY), vpt_on_curve(&pubX, &pubY), sigOK,
             (unsigned long)blob.length, (unsigned long)sig.length]);
     });
     return sigOK;
 }
 
-// 已激活: plist licBlob 对本机设备码验签通过。0.5s 节流缓存(ECDSA ~1ms,
-// 0.15s 轮询全验签无必要; 激活写入后 0.5s 内过期重验, md 下一拍生效)
+// 已激活: plist licBlob 对本机设备码验签通过。2s 节流缓存(1.3.90: 自含 ECDSA
+// 单次 ~14ms, 0.15s 轮询全验签无必要; 2s 缓存下 <0.8% 单核。激活写入后
+// ≤2s 过期重验, md 下两拍内生效 —— 激活 UI 本身直调 vcamLicenseVerifyBlob
+// 即时反馈, 不受缓存影响)
 + (BOOL)vcamLicenseValid {
     @synchronized ([VCamNotify class]) {
         static BOOL cached = NO;
         static double cachedAt = 0;
         static BOOL hasCache = NO;
         double now = [NSDate timeIntervalSinceReferenceDate];
-        if (hasCache && now - cachedAt < 0.5) return cached;
+        if (hasCache && now - cachedAt < 2.0) return cached;
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
         if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
         NSString *blob = dict[@"licBlob"];
