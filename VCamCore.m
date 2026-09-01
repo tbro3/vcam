@@ -16,6 +16,7 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
+#include <libproc.h>
 #include <dlfcn.h>
 #include <string.h>
 #include <fcntl.h>
@@ -36,23 +37,19 @@ extern void vcamLaneResetAllMemos(void);
 // mediaserverd 周期性被杀(相机替换活跃 ~150s)但无 .ips 落盘, 系统侧无法判死因。
 // v2 探针每 30s 记一行: 内存(已证平稳)/进程 CPU%(所有线程 user+system 累计差分)/
 // 按流(w_h_fmt)渲染计数+像素量 —— 被杀前最后一行即可定位烧 CPU 配额的具体流
-static NSString *vcam_process_cpu_seconds(void) {
-    thread_array_t threads;
-    mach_msg_type_number_t tcount = 0;
-    double total = 0;
-    if (task_threads(mach_task_self(), &threads, &tcount) == KERN_SUCCESS) {
-        for (mach_msg_type_number_t i = 0; i < tcount; i++) {
-            thread_basic_info_data_t bi;
-            mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
-            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bc) == KERN_SUCCESS) {
-                total += bi.user_time.seconds + bi.user_time.microseconds / 1e6;
-                total += bi.system_time.seconds + bi.system_time.microseconds / 1e6;
-            }
-            mach_port_deallocate(mach_task_self(), threads[i]);
-        }
-        vm_deallocate(mach_task_self(), (vm_address_t)threads, tcount * sizeof(thread_t));
+// 1.3.88 单调采样(hardTrip 振荡根修): 旧实现 task_threads 逐线程累加是瞬时
+// 快照, 线程退出时其累计时间从总和凭空消失 → 总和非单调(遥测实测 cpu=-1%~
+// -14% 负差分), "负差分只推进时间基线"的旧修法又让后续样本被还债式低估。
+// 毛刺+低估双重噪声把 EMA 反复推过 110 线 → hardTrip 5 分钟 11 次开关
+// (2026-08-30 日志实证) = 24↔20fps 周期横跳 = "打开一段时间后卡顿掉帧不稳定"
+// 直接来源。改 proc_pidinfo(PROC_PIDTASKINFO) 进程级单调累计(pti_total_user
+// +pti_total_system, 内核记账, 线程启停零影响), 差分即真实 CPU%。
+static double vcam_process_cpu_seconds(void) {
+    struct proc_taskinfo pti;
+    if (proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &pti, sizeof(pti)) == (int)sizeof(pti)) {
+        return (double)(pti.pti_total_user + pti.pti_total_system) / 1000000000.0;
     }
-    return [NSString stringWithFormat:@"%.1f", total];
+    return -1.0;  // 采样失败: 调用方按无效样本丢弃(不更新基线)
 }
 
 static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats) {
@@ -69,10 +66,11 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats
         resident = vmInfo.resident_size;
     }
 
-    double cpuSec = [vcam_process_cpu_seconds() doubleValue];
-    double cpuPct = (lastTel > 0 && now > lastTel) ? ((cpuSec - lastCpu) / (now - lastTel) * 100.0) : 0;
+    double cpuSec = vcam_process_cpu_seconds();
+    double cpuPct = (cpuSec >= 0 && lastCpu >= 0 && lastTel > 0 && now > lastTel)
+                    ? ((cpuSec - lastCpu) / (now - lastTel) * 100.0) : 0;
     lastTel = now;
-    lastCpu = cpuSec;
+    if (cpuSec >= 0) lastCpu = cpuSec;
 
     @try {
         if (!vcam_log_budget_take()) return;  // 磁盘配额保护: 遥测也走令牌桶
@@ -848,10 +846,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     // 只做格式转换(stage2 ~2ms) → 单帧成本降 ~60%, 画面=低帧率视频(连续无感)。
     // 解码/预渲染同步 15fps(降载期), CCW90 随冻结 token 自动复用。
     //
-    // 采样修正(2026-08-16 振荡修复): task_threads 是瞬时快照, 线程退出/加入会让
-    // 累计时间差分出现负值(实测 -5%~-50%) → 冻结误判 OFF → 又冲高误判 ON →
-    // 12s 内 3 次横跳 = 用户观感"非常卡顿"的直接来源。修: 负差分丢弃(不更新基线,
-    // 本次不判退); EMA 平滑抗单次毛刺。
+    // 采样(2026-09-01, 1.3.88 振荡根修): 旧 task_threads 逐线程累加是瞬时快照,
+    // 线程退出让累计时间凭空消失(负差分), "负差分只推进时间基线"的旧修法让
+    // 后续样本被还债式低估 —— 毛刺+低估双重噪声把 EMA 反复推过 110 线 →
+    // hardTrip 5 分钟 11 次开关(2026-08-30 日志实证) = 24↔20fps 横跳卡顿。
+    // 1.3.88: 采样改 proc_pidinfo 单调口径 + hardTrip 两级判定(>170 立即压;
+    // 110-170 需连续越线 ≥8s 才压), 双保险根治振荡。
     // 滞回时间窗: 进入后 ≥5s 不许退出, 退出后 ≥8s 不许再进 —— 防高频振荡
         // 紧急档重构(2026-08-17 横跳根治): 旧 46/48 阈值在正常运行区(实测 45-58%)
         // 内部横跳 → 内容 24↔20fps 反复切换 = 卡顿本身。教训: 系统配额是
@@ -879,11 +879,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             // <30s = 冷启动首开, 保留 10s 强制降载(三连崩实证必须压)
             static CFAbsoluteTime bootGraceUntil = 0;
             static BOOL bootGraceDone = NO;
-            // 退出后再进冷却(2026-08-20 横跳修复): 设备实证 OFF→ON 最短 3s
-            // (18:14:26 OFF → 18:14:30 ON), 24↔20fps 快速横跳本身就是卡顿感。
-            // OFF 后 6s 内不许再进(负载在滞回带边缘波动时给用户稳定流畅窗);
-            // hardTrip(>110) 无视冷却立即压(保命优先)
-            static CFAbsoluteTime lastThrottleExit = 0;
+            // 1.3.88 持续确认计时: EMA 首次越过 110 的时刻(回到 110 以下清零)。
+            // 110-170 带需连续越线 ≥8s 才 hardTrip —— 取代旧"单拍越线立即压":
+            // 瞬态尖峰(重载突发/残留噪声)自动免疫, 真持续过载 8s 兜底,
+            // OFF 后重进天然带 8s 冷却, 24↔20fps 横跳根治
+            static CFAbsoluteTime hardHighSince = 0;
             CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
             if (!bootGraceDone) {
                 if (bootGraceUntil == 0) {
@@ -918,8 +918,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             }
             BOOL graceOn = !bootGraceDone;  // 冷却期内强制低功率
             if (nowT - lastCpuCheck > 0.8) {  // 2s→0.8s(2026-08-18): 响应提速, 旧 2s+EMA 滞后 4-6s 挡不住启动风暴
-                double cpuSec = [vcam_process_cpu_seconds() doubleValue];
-                double delta = cpuSec - lastCpuSec;
+                double cpuSec = vcam_process_cpu_seconds();
+                double delta = (cpuSec >= 0 && lastCpuSec >= 0) ? (cpuSec - lastCpuSec) : -1.0;
                 // ===== 自适应解码档位(2026-08-20 多流高压卡顿根治) =====
                 // 设备实证(微信等多流 App): 全分辨率解码 + 3 条 720p 流并行 →
                 // CPU 稳态 80-86% —— (1)远超 daemon 50% 红线有被杀风险;
@@ -1026,7 +1026,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     }
                     // 进入快(2s)/退出 hold 5s(1.3.36 卡顿修复): 旧 10s 保持期让
                     // 短活跃窗口(切模式/速览, 实测 8s)整窗被压 20fps 从未退出;
-                    // 退出后 6s exitCooldown 防横跳仍在, 5s+6s 振荡周期可接受
+                    // 退出后重进由 1.3.88 持续确认(8s)天然冷却防横跳
                     BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 2.0);
                     // 会话豁免(2026-08-20 首开卡顿修复): 相机会话起点(render 心跳
                     // 中断>2s 后恢复 = 热进程首开/空闲重开/切App)后 8s 内, EMA>72
@@ -1036,21 +1036,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     // = "过一段时间才稳定流畅"。8s 后闭环正常接管(持续真过载仍会降载)
                     BOOL sessionExempt = (self->_camSessionStart > 0 &&
                                           (nowT - self->_camSessionStart) < 8.0);
-                    // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)。
-                    // 豁免期内阈值放宽到 170%(1.3.36 卡顿修复): resume/首开风暴
-                    // (解码器异步重载+帧预填+建槽叠加)1-2s 内 EMA 实测冲 124%,
-                    // 180s 均值配额吃得下; 旧 110 绕过豁免立即压 → 切模式短窗口
-                    // 全程 20fps 卡顿。真失控(接近 2 核满载)豁免期内仍立即压
-                    BOOL hardTrip = (emaPct > (sessionExempt ? 170.0 : 110.0));
-                    // 阈值(1.3.47 帧率稳定硬约束重构): 旧 72% 进入线在正常运行带
-                    // (45-58%)之上但远低于多流高压带(80-86%), EMA 徘徊 72-86 时
-                    // 内容被压 20fps 且退出线 62 难以到达 = "长期卡顿"直接来源;
-                    // 72↔62 边缘横跳 = "帧数不稳定"另一来源。用户硬性要求: 替换
-                    // 视频永不掉帧。重构: 常规压力(≤110%)永不降载 —— staging 去重
-                    // (同 gen 跳 stage1) + 不可见流节流已覆盖 CPU 治理, 内容帧率
-                    // 不再作为降载牺牲品; 仅 hardTrip(EMA>110, 豁免期 170)真失控
-                    // (逼近 2 核, 进程将被杀 = 相机全黑)时紧急介入, 保命优先。
+                    // 1.3.88 两级硬闸(振荡根治): 设备实证(2026-08-30) EMA 110-119%
+                    // 连续 5 分钟零 kill(195% 冷启动风暴才是秒杀区) —— 旧"单拍
+                    // 越线立即压"被瞬态尖峰(重载突发/残留噪声)反复拉闸, 5 分钟
+                    // 11 次 ON/OFF = 24↔20fps 周期横跳 = "一段时间后卡顿掉帧
+                    // 不稳定"直接来源。两级: >170%(逼近 2 核, 实证秒杀区)立即压;
+                    // 110-170 需连续越线 ≥8s 才压(瞬态尖峰自动免疫, 真持续过载
+                    // 180s 配额红线仍兜底)。EMA 回到 110 以下即重置计时;
+                    // 豁免期(sessionExempt)只认 170 立即线, 风暴豁免语义不变。
                     // 退出线 62 不变(hardTrip 压下 CPU 后自然退出)
+                    if (emaPct > 110.0) { if (hardHighSince == 0) hardHighSince = nowT; }
+                    else hardHighSince = 0;
+                    BOOL hardTrip = (emaPct > 170.0)
+                        || (!sessionExempt && hardHighSince > 0 && (nowT - hardHighSince) >= 8.0);
                     if (hardTrip && !lowPower) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
@@ -1058,13 +1056,16 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     } else if (emaPct < 62.0 && lowPower && minHoldOk && !graceOn) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
-                        lastThrottleExit = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <62%%, throttle OFF", emaPct]);
                     }
                 }
-            // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
-            lastCpuSample = nowT;
-            if (delta >= 0 || lastCpuSec == 0) lastCpuSec = cpuSec;
+            // 1.3.88: 单调采样下有效样本直接刷新双基线(差分恒 ≥0, 负差分分支
+            // 随 task_threads 实现移除); 采样失败(cpuSec<0)双基线原地不动,
+            // 下轮用原窗口重算
+            if (cpuSec >= 0) {
+                lastCpuSample = nowT;
+                lastCpuSec = cpuSec;
+            }
             lastCpuCheck = nowT;
             self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
         }
