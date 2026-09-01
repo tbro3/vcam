@@ -989,7 +989,7 @@ static void vpt_mul2(vcam_pt *R, const vcam_u256 *k1, const vcam_pt *Q1,
         vpt_dbl(R, R);
         int b1 = (int)((k1->v[i >> 6] >> (i & 63)) & 1u);
         int b2 = (int)((k2->v[i >> 6] >> (i & 63)) & 1u);
-        int idx = (b1 << 1) | b2;
+        int idx = b1 | (b2 << 1);   // bit0=k1→T[1]=Q1, bit1=k2→T[2]=Q2
         if (idx) vpt_add(R, R, &T[idx]);
     }
 }
