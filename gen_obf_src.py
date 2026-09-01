@@ -220,7 +220,14 @@ def transform(text, in_directive=False):
                 # @selector 字面量若不同步改名, 运行时 sel_registerName 查
                 # 不到方法(IMP 自检返回 msgForward 地址 → 恒误报 → 门禁
                 # 恒关, 1.3.78 首部署设备日志实锤 b0==b1==msgForward)
-                sel = IDENT_RENAMES.get(sel, sel)
+                # 1.3.90: 带参选择器(形如 "name:")的冒号剥离后再查表,
+                # 命中则把冒号拼回改名后 —— 旧版直接查全名(含冒号)必落空
+                # → 定义改名为 qvVb: 而 selector 仍是 vcamLicenseVerifyBlob:
+                # → 运行时查无此方法(msgForward), 1.3.90 首部署 b3-b5 实锤
+                if sel.endswith(':') and sel[:-1] in IDENT_RENAMES:
+                    sel = IDENT_RENAMES[sel[:-1]] + ':'
+                else:
+                    sel = IDENT_RENAMES.get(sel, sel)
                 out.append('obfSEL(%d)' % register(sel))
                 i = j
                 continue
@@ -615,7 +622,11 @@ def verify_source_fidelity(paths):
             elif m.group(2) is not None:
                 val = ''.join(m.group(2).split())
                 # 1.3.78: 与 @selector 变换同步走改名映射(注册值是改名后的)
-                val = IDENT_RENAMES.get(val, val)
+                # 1.3.90: 带参选择器冒号剥离后查表(与变换侧同口径)
+                if val.endswith(':') and val[:-1] in IDENT_RENAMES:
+                    val = IDENT_RENAMES[val[:-1]] + ':'
+                else:
+                    val = IDENT_RENAMES.get(val, val)
                 if val and val not in _str_map:
                     problems.append('%s: selector 不在密表: %r' % (fname, val))
             else:
