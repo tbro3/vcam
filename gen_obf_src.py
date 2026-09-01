@@ -483,6 +483,8 @@ IDENT_RENAMES = {
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
     'vcamSelfTextOK': 'qvTs2',                  # C static(VCamCore.m): __TEXT 哈希自校验(1.3.70)
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
+    'vcamTamperNote': 'qzTn',                   # 1.3.91 全局(VCamCore.m): 篡改登记(全局符号进符号表, 须改名)
+    'vcamScatterChk': 'qzSc',                   # 1.3.91 全局(VCamCore.m): 散射复核(extern 跨文件引用)
     'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
     'vcamDigestHex16': 'qzDh',                  # C static(VCamNotify.m): SHA256 派生
     'vcamMGResolve': 'qzMg',                    # C static(VCamNotify.m): MobileGestalt
