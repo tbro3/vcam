@@ -1035,7 +1035,7 @@ void vcamLaneResetAllMemos(void) {
 
 // 前置声明(定义在本文件后部): CPU 旋转回退路径使用
 static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst);
-static void vcamMirrorRowsInPlace(CVPixelBufferRef pb);
+static void vcamFlipInPlace(CVPixelBufferRef pb, BOOL vertical);
 static BOOL vcamRotateBufferCPU(CVPixelBufferRef src, CVPixelBufferRef dst, int angle);
 static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst);
 
@@ -1059,7 +1059,7 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
             CVPixelBufferRelease(dst);
             return NULL;
         }
-        if (_mirrored) vcamMirrorRowsInPlace(dst);
+        if (_mirrored) vcamFlipInPlace(dst, (angle == 90 || angle == 270));
         vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 buffer 附件同步
         return dst;
     }
@@ -1087,9 +1087,8 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     } else {
         VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, kCFBooleanFalse);  // 显式归零防残留
     }
-    // 设置镜像
-    VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
-
+    // 1.3.92: 不再设置 VT flip 属性 —— 420f 上报 -12914, 且残留状态会污染共用的
+    // _pixelRotationSession(预渲染纯旋转路径共用本 session), 镜像统一 CPU 实现
     status = _transferRotationImage(_pixelRotationSession, input, dst);
     if (status != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelRotationSession failed: %d, falling back to CPU rotation", (int)status]);
@@ -1101,7 +1100,7 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
             BOOL ok = (angle != 0) ? vcamRotateBufferCPU(input, dst, angle)
                                    : vcamCopyPlanes(input, dst);
             if (ok) {
-                if (_mirrored) vcamMirrorRowsInPlace(dst);
+                if (_mirrored) vcamFlipInPlace(dst, (angle == 90 || angle == 270));
                 vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 buffer 附件同步
                 return dst;
             }
@@ -1111,6 +1110,7 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     }
 
     vcamSyncColorAttachments(input, dst);  // 1.3.85: 裸建 rotation buffer 附件同步
+    if (_mirrored) vcamFlipInPlace(dst, (angle == 90 || angle == 270));  // 1.3.92 CPU 镜像
     return dst;
 }
 
@@ -1127,15 +1127,55 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     else _prerenderRotatePool2 = buf;
 }
 
-// CPU 水平镜像(原地行反转): 420f/420v Y 平面按 1 字节粒度、UV 平面按 2 字节粒度
-// (CbCr 对不能拆开), BGRA 按 4 字节粒度。~3MB 帧约 1ms(预渲染线程可承受)。
+// 1.3.92 镜像语义修正: "翻"=镜像视频源内容(先镜像、后旋转), 而非镜像旋转后的
+// 显示画面。数学等价: R90/270∘F_h = F_v∘R90/270 —— 即旋转态为 90/270 时对
+// 旋转后的帧做【垂直翻转】(行序上下互换), 0/180 时保持水平行反转(两种顺序
+// 在 0/180 天然等价, 这也是旧版 0/180 正确、90/270 差 180° 的根因)。
+// 水平: 420f/420v Y 平面按 1 字节粒度、UV 平面按 2 字节粒度(CbCr 对不能拆开),
+// BGRA 按 4 字节粒度; 垂直: 逐平面行序上下 swap(行尾 padding 不动)。
+// ~3MB 帧约 1ms(预渲染线程可承受)。
 // 千面二进制无任何 Flip 属性字符串 —— VTPixelRotationSession 的 flip 在 420f 上
 // 不支持(-12914), 镜像必须自己实现(对齐千面: VT 只做纯旋转)
-static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
+static void vcamFlipInPlace(CVPixelBufferRef pb, BOOL vertical) {
     if (!pb) return;
     CVPixelBufferLockBaseAddress(pb, 0);
     int planes = (int)CVPixelBufferGetPlaneCount(pb);
-    if (planes <= 0) {
+    if (vertical) {
+        // 垂直翻转: 行序上下互换(仅 swap 数据行宽, 行尾 padding 原地不动)
+        if (planes <= 0) {
+            uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+            size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+            size_t rowBytes = CVPixelBufferGetWidth(pb) * 4;
+            size_t h = CVPixelBufferGetHeight(pb);
+            uint8_t *tmp = (rowBytes && h) ? (uint8_t *)malloc(rowBytes) : NULL;
+            for (size_t y = 0; y < h / 2 && base && tmp; y++) {
+                uint8_t *top = base + y * bpr;
+                uint8_t *bot = base + (h - 1 - y) * bpr;
+                memcpy(tmp, top, rowBytes);
+                memcpy(top, bot, rowBytes);
+                memcpy(bot, tmp, rowBytes);
+            }
+            free(tmp);
+        } else {
+            for (int p = 0; p < planes; p++) {
+                uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, p);
+                size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
+                size_t pw = CVPixelBufferGetWidthOfPlane(pb, p);
+                size_t ph = CVPixelBufferGetHeightOfPlane(pb, p);
+                size_t px = (p == 0) ? 1 : 2;  // Y=1字节/px, UV=2字节/px(CbCr 对)
+                size_t rowBytes = pw * px;
+                uint8_t *tmp = (rowBytes && ph) ? (uint8_t *)malloc(rowBytes) : NULL;
+                for (size_t y = 0; y < ph / 2 && base && tmp; y++) {
+                    uint8_t *top = base + y * bpr;
+                    uint8_t *bot = base + (ph - 1 - y) * bpr;
+                    memcpy(tmp, top, rowBytes);
+                    memcpy(top, bot, rowBytes);
+                    memcpy(bot, tmp, rowBytes);
+                }
+                free(tmp);
+            }
+        }
+    } else if (planes <= 0) {
         // 单平面 BGRA: 4 字节/像素
         uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
         size_t bpr = CVPixelBufferGetBytesPerRow(pb);
@@ -1473,10 +1513,12 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         vcamSyncColorAttachments(input, work);
     }
 
-    // 阶段2: 镜像(CPU 行反转)
+    // 阶段2: 镜像 —— 语义=镜像视频源内容(先镜像后旋转):
+    // work 已按 total 旋转 → 90/270 时垂直翻转等价实现(R∘F_h = F_v∘R),
+    // 0/180 保持水平行反转(两种顺序数学等价)
     if (!needMirror) return work;  // CF_RETURNS_RETAINED
     if (workIsWritable) {
-        vcamMirrorRowsInPlace(work);
+        vcamFlipInPlace(work, (total == 90 || total == 270));
         return work;
     }
     // mirror-only: 复制到几何槽再反转(不动解码器 buffer)
@@ -1500,7 +1542,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         }
     }
     if (mb && vcamCopyPlanes(work, mb)) {
-        vcamMirrorRowsInPlace(mb);
+        vcamFlipInPlace(mb, NO);  // 此分支 work=未旋转源帧 → 水平镜像源内容
         // 1.3.85: mirror-copy 出的槽 buffer 同样裸建, 附件同步(同上)
         vcamSyncColorAttachments(work, mb);
         CVPixelBufferRelease(work);
