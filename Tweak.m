@@ -48,6 +48,8 @@
 #import <string.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <sys/sysctl.h>
+#import <stdlib.h>
 
 #import "VCamCore.h"
 #import "VCamFloatingBall.h"
@@ -450,6 +452,102 @@ static void initializeInMediaserverd(void) {
     vcam_tweak_log(@"[vcam] MediaServerd hooks initialized");
 }
 
+#pragma mark - 1.3.93 半绑定越狱 mediaserverd 陈旧自愈
+// 场景(palera1n 等 checkm8 半绑定越狱): 重启后重新越狱只 respring SpringBoard
+// (SB 被重新拉起 → 本 dylib 注入 → 悬浮球正常显示), 但 mediaserverd 是开机时
+// (越狱挂钩生效前)由未挂钩 launchd 拉起的【存量进程】—— 没有注入, 相机替换
+// 静默失效(症状恰好是"悬浮球在但不替换")。RootHide 等开机即注入的越狱不受
+// 影响; postinst 装机时 kill 过一次 md, 但每次重启+重新越狱后 md 又回到
+// 无注入状态, 用户必须手动 killall。
+// 自愈原理: SB 启动 3s 后核对"md 加载信标(vcam_load.txt)的时间是否晚于本次
+// 开机时刻" —— 信标陈旧 = md 仍是越狱前的老进程 → kill 它, 已挂钩的 launchd
+// 重新拉起注入版(launchd KeepAlive)。合法用户仅每开机一次 ~3ms sysctl + 文件
+// 读取, 零帧率扰动。
+static BOOL vcamBootEpoch(double *outEpoch) {
+    struct timeval tv;
+    size_t len = sizeof(tv);
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &tv, &len, NULL, 0) != 0 || len != sizeof(tv)) return NO;
+    *outEpoch = (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+    return YES;
+}
+
+// 最近一次 mediaserverd 加载信标时间(无则 0)。双路径取最大值(roothide 视图兼容)
+static double vcamLastMdBeaconEpoch(void) {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss Z";
+    });
+    double best = 0;
+    for (NSString *p in @[@"/var/mobile/Media/DCIM/vcam_load.txt",
+                          @"/rootfs/private/var/mobile/Media/DCIM/vcam_load.txt"]) {
+        NSString *content = [NSString stringWithContentsOfFile:p
+                          encoding:NSUTF8StringEncoding error:nil];
+        if (content.length == 0) continue;
+        for (NSString *line in [content componentsSeparatedByString:@"\n"]) {
+            if ([line rangeOfString:@"loaded in mediaserverd"].location == NSNotFound) continue;
+            if (![line hasPrefix:@"["]) continue;
+            NSRange close = [line rangeOfString:@"]"];
+            if (close.location == NSNotFound || close.location < 2) continue;
+            NSDate *d = [fmt dateFromString:[line substringWithRange:NSMakeRange(1, close.location - 1)]];
+            if (d) {
+                double t = d.timeIntervalSince1970;
+                if (t > best) best = t;
+            }
+        }
+    }
+    return best;
+}
+
+static void vcamKickStaleMediaserverd(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            double bootEpoch = 0;
+            if (!vcamBootEpoch(&bootEpoch)) return;
+            double mdTs = vcamLastMdBeaconEpoch();
+            // 120s 容忍时钟偏移: 信标晚于开机(容忍回拨)才视为本次开机内已加载
+            if (mdTs > bootEpoch - 120.0) return;
+            // 10 分钟节流: 信标异常写不出的环境防 kill 循环(md 重拉后仍无信标
+            // 最多每 10 分钟再试一次, 可观察可恢复)
+            NSString *kickPath = @"/var/mobile/Media/DCIM/vcam_mdkick.txt";
+            double nowEpoch = [[NSDate date] timeIntervalSince1970];
+            NSDictionary *km = [NSDictionary dictionaryWithContentsOfFile:kickPath];
+            double lastKick = [km[@"ts"] doubleValue];
+            if (lastKick > 0 && nowEpoch - lastKick < 600.0) return;
+            [@{@"ts": @(nowEpoch)} writeToFile:kickPath atomically:YES];
+            // 直杀(sysctl 找 pid): SB 与 mediaserverd 同为 mobile uid, kill 无需 root;
+            // 不走 posix_spawn killall —— 半绑定环境路径视图不可靠
+            BOOL killed = NO;
+            size_t size = 0;
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+            if (sysctl(mib, 4, NULL, &size, NULL, 0) == 0 && size > 0) {
+                void *buf = malloc(size);
+                if (buf) {
+                    if (sysctl(mib, 4, buf, &size, NULL, 0) == 0) {
+                        struct kinfo_proc *kp = (struct kinfo_proc *)buf;
+                        size_t n = size / sizeof(struct kinfo_proc);
+                        for (size_t i = 0; i < n; i++) {
+                            // p_comm 16B 截断, "mediaserverd"(12B) 安全
+                            if (strcmp(kp[i].kp_proc.p_comm, "mediaserverd") == 0 &&
+                                kp[i].kp_proc.p_pid > 1) {
+                                if (kill(kp[i].kp_proc.p_pid, SIGKILL) == 0) killed = YES;
+                            }
+                        }
+                    }
+                    free(buf);
+                }
+            }
+            vcam_tweak_log([NSString stringWithFormat:
+                @"[vcam] mediaserverd stale (beacon=%.0f boot=%.0f), kicked=%d — 半绑定自愈",
+                mdTs, bootEpoch, killed]);
+        } @catch (NSException *e) {}
+    });
+}
+
 static void initializeInSpringBoard(void) {
     vcam_tweak_log(@"[vcam] SpringBoard hooks initialized");
 
@@ -461,6 +559,9 @@ static void initializeInSpringBoard(void) {
 
     // 显示悬浮球
     [[VCamFloatingBall sharedInstance] showFloatingBall];
+
+    // 1.3.93: 半绑定越狱自愈(md 未注入时 SB 侧 kick, 详见函数头注释)
+    vcamKickStaleMediaserverd();
 }
 
 #pragma mark - 入口

@@ -270,9 +270,11 @@ static BOOL vcamSelfIntegrityOK(void) {
 }
 
 // ===== __TEXT 哈希自校验(1.3.70 防破解加强, 磁盘口径) =====
-// 原理: 构建期 inject_text_sig.py 对 fat dylib 的 arm64e slice __TEXT 段
-// 跳 40B 签名洞计算 SHA256 写入洞内; 本函数运行时【直接读磁盘文件】用
-// 完全相同口径重算比对(洞在 __TEXT,__vcsig, inject 与本函数同源)。
+// 原理: 构建期 inject_text_sig.py 对 fat dylib 的【每个 slice】(arm64 +
+// arm64e)__TEXT 段跳 40B 签名洞计算 SHA256 写入洞内; 本函数运行时【直接读
+// 磁盘文件】按【运行架构】选定 slice(1.3.93: 旧版硬选 arm64e, arm64 设备
+// 加载 slice 不受保护)用完全相同口径重算比对(洞在 __TEXT,__vcsig, inject
+// 与本函数同源)。
 // 任何对 dylib __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)→ 磁盘
 // 哈希失配 → licMark 关门禁 → 替换/打光静默失效。
 //
@@ -321,6 +323,21 @@ static BOOL vcamSelfTextOK(void) {
     if (dladdr((void *)&vcamSelfTextOK, &info) == 0 || !info.dli_fname) return NO;
     const char *fname = info.dli_fname;
 
+    // 1.3.93(修): 运行 slice 架构自适应。旧版硬选 fat 里的 arm64e slice ——
+    // arm64 设备(A11 及更早的 checkm8 机型, 如 iPhone X)上 dyld 实际加载的是
+    // arm64 slice, 自校验却始终在验磁盘上的 arm64e slice: 合法用户碰巧通过
+    // (同文件自洽), 但真正运行的 arm64 __TEXT 完全脱离保护(改 arm64 代码段
+    // 不触发门禁)。现从【运行中镜像】的 Mach-O 头读 cputype/cpusubtype,
+    // 选 fat 里对应条目校验 —— arm64e 设备行为不变, arm64 设备首次真正纳入
+    // __TEXT 自校验(inject_text_sig.py 本就逐 slice 注入各自哈希)。
+    uint32_t wantCpu = 0, wantSub = 0;
+    {
+        uint32_t hdr[3];
+        memcpy(hdr, info.dli_fbase, sizeof(hdr));
+        wantCpu = hdr[1];  // mach_header_64: magic(0) cputype(4) cpusubtype(8)
+        wantSub = hdr[2];
+    }
+
     // 读磁盘文件全文(763KB; 30s 节流一次可接受)
     int fd = open(fname, O_RDONLY, 0);
     if (fd < 0) return NO;
@@ -336,7 +353,7 @@ static BOOL vcamSelfTextOK(void) {
     const uint8_t *fb = (const uint8_t *)fileData.bytes;
     size_t flen = (size_t)fsz;
 
-    // fat 定位 arm64e slice(fat 头大端: magic CAFEBABE/F, nfat, 20B/项)
+    // fat 定位【运行架构】slice(fat 头大端: magic CAFEBABE/F, nfat, 20B/项)
     uint32_t sliceOff = 0, sliceSize = 0;
     uint32_t fmagic = (uint32_t)fb[0] << 24 | (uint32_t)fb[1] << 16 | (uint32_t)fb[2] << 8 | fb[3];
     if (fmagic == 0xCAFEBABEu || fmagic == 0xCAFEBABFu) {
@@ -348,10 +365,26 @@ static BOOL vcamSelfTextOK(void) {
             uint32_t cpusub  = (uint32_t)e[4] << 24 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 8 | e[7];
             uint32_t off     = (uint32_t)e[8] << 24 | (uint32_t)e[9] << 16 | (uint32_t)e[10] << 8 | e[11];
             uint32_t size    = (uint32_t)e[12] << 24 | (uint32_t)e[13] << 16 | (uint32_t)e[14] << 8 | e[15];
-            if (cputype == 0x0100000C && (cpusub & 0x00FFFFFF) == 2) {
+            if (cputype == wantCpu && (cpusub & 0x00FFFFFF) == (wantSub & 0x00FFFFFF)) {
                 sliceOff = off;
                 sliceSize = size;
                 break;
+            }
+        }
+        if (sliceOff == 0 || sliceOff + sliceSize > flen) {
+            // 运行架构条目未命中(异常防御): 回退旧口径选 arm64e —— 与历史
+            // 行为一致, 合法用户不受影响(保护强度不劣于旧版)
+            for (uint32_t i = 0; i < nfat && 8 + 20 * (i + 1) <= flen; i++) {
+                const uint8_t *e = fb + 8 + 20 * i;
+                uint32_t cputype = (uint32_t)e[0] << 24 | (uint32_t)e[1] << 16 | (uint32_t)e[2] << 8 | e[3];
+                uint32_t cpusub  = (uint32_t)e[4] << 24 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 8 | e[7];
+                uint32_t off     = (uint32_t)e[8] << 24 | (uint32_t)e[9] << 16 | (uint32_t)e[10] << 8 | e[11];
+                uint32_t size    = (uint32_t)e[12] << 24 | (uint32_t)e[13] << 16 | (uint32_t)e[14] << 8 | e[15];
+                if (cputype == 0x0100000C && (cpusub & 0x00FFFFFF) == 2) {
+                    sliceOff = off;
+                    sliceSize = size;
+                    break;
+                }
             }
         }
         if (sliceOff == 0 || sliceOff + sliceSize > flen) return NO;
