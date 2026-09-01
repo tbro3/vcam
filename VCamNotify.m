@@ -1282,6 +1282,11 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     VcamUICreateScreenImageFn capFn =
         (VcamUICreateScreenImageFn)dlsym(RTLD_DEFAULT, "UICreateScreenImage");
     if (!capFn) return 0;
+    // 1.3.89 崩溃根修(2026-09-01 相机 4 连崩实证): UICreateScreenImage 在
+    // 照片模式/前后台切换等状态内部 __CFDictionaryCreateGeneric 抛 ObjC 异常,
+    // 采样器跑在 dispatch block 里无兜底 → 未捕获异常 SIGABRT 杀死宿主 App。
+    // 本拍失败返回 0(无色), 滑窗机制天然容忍个别拍丢失。
+    @try {
     CGImageRef full = capFn();
     if (!full) return 0;
     size_t iw = CGImageGetWidth(full), ih = CGImageGetHeight(full);
@@ -1382,6 +1387,10 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     // 总线刷新时间戳, 颜色稳定也能保活新鲜度(1s 窗口)
     [self vcamNotifyPickSlot:outSlot];
     return outSlot;
+    } @catch (NSException *e) {
+        // 兜底: UICSI 内部异常不吃帧语义, 返回 0(无色拍)
+        return 0;
+    }
 }
 
 // App 采样器入口(Tweak.m constructor App 分支调用):
@@ -1416,6 +1425,9 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
                 (void)t;
             });
 
+        // 1.3.89 采样耗时 EMA + 跳拍计数(跨 block 静态, 采样队列写/主队列读)
+        static double sSampDurEma = 0;
+        static int sSampSkipLeft = 0;
         dispatch_queue_t sampQ = dispatch_queue_create("com.vcam.samp", NULL);
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -1430,9 +1442,31 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
             UIApplication *app = [UIApplication sharedApplication];
             if (!app || app.applicationState != UIApplicationStateActive) return;
             if (!cfgEn) return;
+            // 1.3.89 CPU 自适应退避(17:46 Camera cpu_resource 97% 实证):
+            // 相机照片模式等重绘场景 UICSI 单拍可达 ~77ms(全屏捕获与实时
+            // 预览合成竞争), 12.5Hz 全速跑 = 采样器独占一整核 → 宿主 App
+            // 超 CPU 配额被杀。按采样耗时 EMA 跳拍, 采样器 CPU 上限 ~30%:
+            //   ema>160ms 隔5拍(~2Hz) / >80ms 隔2拍(~4Hz) / >40ms 隔1拍(~6Hz)
+            // 滑窗投票是按拍数(非绝对时间)判定, 跳拍只拉长响应不改语义。
+            if (sSampSkipLeft > 0) { sSampSkipLeft--; return; }
+            if (sSampDurEma > 0.16) sSampSkipLeft = 5;
+            else if (sSampDurEma > 0.08) sSampSkipLeft = 2;
+            else if (sSampDurEma > 0.04) sSampSkipLeft = 1;
             dispatch_async(sampQ, ^{
-                diagLastSlot = [self vcamAppSampleSlotAtX:cfgPx Y:cfgPy];
-                diagSamp++;
+                // 1.3.89 后台竞态二次判定(18:54 相机后台崩溃实证): 主队列
+                // 判定后 App 可能已切入后台, UICSI 在后台 App 直接抛异常。
+                // 采样队列执行前再查一次, 竞态窗口内直接放弃本拍。
+                UIApplication *app2 = [UIApplication sharedApplication];
+                if (!app2 || app2.applicationState != UIApplicationStateActive) return;
+                CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+                @try {
+                    diagLastSlot = [self vcamAppSampleSlotAtX:cfgPx Y:cfgPy];
+                    diagSamp++;
+                } @catch (NSException *e) {
+                    // 双保险: 采样内部异常也不允许杀死宿主
+                }
+                double dur = CFAbsoluteTimeGetCurrent() - t0;
+                sSampDurEma = (sSampDurEma > 0) ? (sSampDurEma * 0.7 + dur * 0.3) : dur;
                 if (vcamPickShmMap() != NULL) diagMmap++;
             });
         });
