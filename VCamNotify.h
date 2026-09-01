@@ -117,10 +117,13 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 //   单边被 Hook → 不一致 → 门禁关闭(VCamCore licMark)。
 //   激活后永久有效(无月/年); 换设备 → 设备码变 → 密钥失效。
 + (NSString *)vcamDeviceCode;                     // 16 hex 大写(设备码 raw)
-+ (BOOL)vcamLicenseValid;                         // 已激活(每次重验签, 0.5s 节流)
++ (BOOL)vcamLicenseValid;                         // 已激活(每次重验签, 2s 节流)
 + (BOOL)vcamActivateLicense:(NSString *)input;    // 激活(验签通过写 licBlob)
 + (void)vcamPublishDeviceCode;                    // SB 侧发布 dcPub(md 互证用)
 + (BOOL)vcamCrossDeviceCodeOK;                    // md 侧: dcPub 与本机一致
+// 1.3.91 跨文件声明(原私有, VCamCore 散射复核需直调): blob 直验(无节流缓存,
+// 自含 ECDSA ~14ms, 仅低频点调用; 头文件不进二进制, 无泄露面)
++ (BOOL)vcamLicenseVerifyBlob:(NSString *)blob;
 
 // 1.3.63 方案A(密钥参与功能解密): blob v2 = 签名 + T_enc 参数密文,
 // 验签通过才能解密出功能真值 —— 跳过验证 = 参数全垃圾(画面数学错误)。
