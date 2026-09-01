@@ -198,9 +198,11 @@ static void vcam_player_log(NSString *msg) {
     return 30.0;
 }
 
-// 解码分辨率上限(2026-08-17 画质优先恢复 720):
-// 用户明确要求不压缩画质 → 恢复长期使用的 720 档(540 实验取消)。
-// CPU 预算改由同格式 staging(stage2 blit 化)承担。vc.plist "decodeMaxEdge": 0=不限制
+// 解码分辨率上限(2026-09-01, 1.3.88 画质优先: 默认原生):
+// 用户硬性要求"永不降低源视频解码分辨率"(画质优先于 CPU/发热) —— 旧默认
+// 720 档把 720x960 源视频压到 540x720 解码(观感糊)。默认 0=按源分辨率原生
+// 解码; CPU 压力由 hardTrip 两级持续确认(真失控才压 20fps)+staging 去重
+// 承担。vc.plist "decodeMaxEdge" 显式设置 >0 时尊重用户值。
 static size_t vcam_decode_max_edge(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -208,11 +210,11 @@ static size_t vcam_decode_max_edge(void) {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
             if (d && d[@"decodeMaxEdge"]) {
                 NSInteger v = [d[@"decodeMaxEdge"] integerValue];
-                cached = (int)(v >= 0 ? v : 720);
+                cached = (int)(v > 0 ? v : 0);
             } else {
-                cached = 720;
+                cached = 0;
             }
-        } @catch (NSException *e) { cached = 720; }
+        } @catch (NSException *e) { cached = 0; }
     }
     return (size_t)cached;
 }
