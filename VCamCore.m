@@ -209,10 +209,19 @@ static BOOL vcamSelfIntegrityOK(void) {
     // IMP; 传类本身查的是实例方法表 → miss → 返回 _objc_msgForward
     // (libobjc 镜像, 恒在本镜像外) → 恒误报 res=0。1.3.78 首部署日志
     // 实锤(b0==b1==197a5a2c0 = msgForward 地址)
+    // 1.3.90 扩展(防跨机许可重放): +vcamDeviceCode 被 swizzle 成"受害者
+    // 设备码"时, 受害者的有效许可在本机全链通过(验签消息/互证 dcPub 全
+    // 对上) —— 纳入 IMP 范围自检封死 swizzle 路线(C 级 MGCopyAnswer/IOKit
+    // 内联 hook 需同时攻陷 SB+md 两进程双 API 路径, 门槛极高, 残余风险
+    // 已知)。+vcamActivateLicense:/+vcamLicenseDecodeT: 同批纳入。
     Class clsB = object_getClass([VCamNotify class]);  // VCamNotify 元类
-    SEL selsB[2] = {
+    SEL selsB[6] = {
         @selector(vcamLicenseValid),
         @selector(vcamCrossDeviceCodeOK),
+        @selector(vcamDeviceCode),
+        @selector(vcamLicenseVerifyBlob:),
+        @selector(vcamActivateLicense:),
+        @selector(vcamLicenseDecodeT:),
     };
     BOOL res = YES;
     for (int i = 0; i < 3; i++) {
@@ -220,7 +229,7 @@ static BOOL vcamSelfIntegrityOK(void) {
         uintptr_t a = ((uintptr_t)imp) & vaMask;
         if (a < textStart || a >= textEnd) res = NO;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 6; i++) {
         IMP imp = class_getMethodImplementation(clsB, selsB[i]);
         uintptr_t a = ((uintptr_t)imp) & vaMask;
         if (a < textStart || a >= textEnd) res = NO;
@@ -231,7 +240,7 @@ static BOOL vcamSelfIntegrityOK(void) {
     if (!intDiagLogged) {
         intDiagLogged = YES;
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] self int diag text=[%lx,%lx) mask=%lx a0=%lx a1=%lx a2=%lx b0=%lx b1=%lx raw0=%lx res=%d",
+            @"[vcam] self int diag text=[%lx,%lx) mask=%lx a0=%lx a1=%lx a2=%lx b0=%lx b1=%lx b2=%lx b3=%lx b4=%lx b5=%lx raw0=%lx res=%d",
             (unsigned long)textStart, (unsigned long)textEnd,
             (unsigned long)vaMask,
             ((uintptr_t)class_getMethodImplementation(clsA, selsA[0])) & vaMask,
@@ -239,6 +248,10 @@ static BOOL vcamSelfIntegrityOK(void) {
             ((uintptr_t)class_getMethodImplementation(clsA, selsA[2])) & vaMask,
             ((uintptr_t)class_getMethodImplementation(clsB, selsB[0])) & vaMask,
             ((uintptr_t)class_getMethodImplementation(clsB, selsB[1])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[2])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[3])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[4])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[5])) & vaMask,
             (uintptr_t)class_getMethodImplementation(clsA, selsA[0]), res]);
     }
     return res;
@@ -717,6 +730,23 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     // 轮询已按 effEnabled 停管线, 此处拦截竞态窗口(plist enabled=YES 而
     // 门禁尚未轮询到/被绕过 UI 直改 plist/内存强翻 BOOL 未到下一拍)
     if (!_licGate || !_licMark) return;
+    // 1.3.90 渲染线程本地门禁复核(防 ivar 高频强翻): 双变量由轮询线程
+    // 0.15s 派生, 攻击者可用注入脚本在轮询间隙持续强翻 ivar 绕过纠正
+    // —— 此处每 1s 本地重派生一次, 结果只进静态内部变量+与 ivar 双重
+    // 相与。复核走缓存(2s)的 ECDSA + μs 级 IMP 自检, 不占渲染预算;
+    // 逼攻击者从"翻 3 个 BOOL"升级到"改代码页"(__TEXT 内存哈希 30s 内
+    // 必失配关门禁)。多 hook 线程并发读 static: BOOL/double 无撕裂, 最坏
+    // 重复计算一次, 结果语义一致。
+    {
+        static double sLastLocalChk = 0;
+        static BOOL sLocalGate = NO;
+        double nowL = CFAbsoluteTimeGetCurrent();
+        if (nowL - sLastLocalChk > 1.0) {
+            sLastLocalChk = nowL;
+            sLocalGate = [VCamNotify vcamLicenseValid] && vcamSelfIntegrityOK();
+        }
+        if (!sLocalGate) return;
+    }
 
     // 同帧去重 v2(2026-08-19 IOFence GPU 死锁根治): 指针 + PTS 双重判定, 检查与
     // 登记同锁原子完成。旧"指针+5ms 窗"两个缺陷(设备实证 00:00:13 gpuEvent
