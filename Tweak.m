@@ -110,14 +110,11 @@ static void vcam_tweak_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 照片过曝: 到达诊断 + 曝光元数据剥离(metaFix)
+#pragma mark - 照片过曝: 曝光元数据剥离(metaFix)
 // 背景(2026-08-15 千面对比实测): 拍照(静止照片/实况封面)过曝 = 照片合成管线基于
 // 真实镜头进光元数据(LuxLevel/ExposureTime 等)做曝光增益, 千面同样过曝。
 // 本实验超越千面: 在 still 管线入口剥离曝光元数据, 下游合成拿不到"暗光"信息
 // 理论上不再拉增益。A/B 开关: vc.plist "metaFix"(默认 YES), 3 秒内生效无需重启。
-static int vcamScalerArrCount = 0;
-static int vcamEncoderArrCount = 0;
-static int vcamPhotoEmitCount = 0;
 
 // metaFix 默认 NO(2026-08-19 UAF 崩溃修复): CMRemoveAttachment 在 CMCapture 管线并发
 // 使用的 attachments 字典上删 key —— emit/scaler/encoder 三个 hook 在不同 Apple 队列
@@ -163,69 +160,13 @@ static void vcamStripExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
     }
 }
 
-// 中心十字 5 点 Y/G 采样(与 VCamCore dumpBufferDiagnostics 同模式)
-static NSString *vcamLumaSamples(CVPixelBufferRef pb) {
-    if (!pb) return @"nil";
-    size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    NSMutableArray *samples = [NSMutableArray array];
-    size_t xs[5], ys[5];
-    size_t cx = w / 2, cy = h / 2;
-    xs[0] = cx;      ys[0] = cy;
-    xs[1] = cx / 2;  ys[1] = cy;
-    xs[2] = cx + cx / 2; ys[2] = cy;
-    xs[3] = cx;      ys[3] = cy / 2;
-    xs[4] = cx;      ys[4] = cy + cy / 2;
-    if (CVPixelBufferGetPlaneCount(pb) >= 1) {
-        uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-        if (base) for (int i = 0; i < 5; i++)
-            if (xs[i] < w && ys[i] < h) [samples addObject:@(base[ys[i] * bpr + xs[i]])];
-    } else {
-        uint8_t *base = CVPixelBufferGetBaseAddress(pb);
-        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-        if (base) for (int i = 0; i < 5; i++)
-            if (xs[i] < w && ys[i] < h) [samples addObject:@(base[ys[i] * bpr + xs[i] * 4 + 1])];
-    }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    return samples.description;
-}
-
-static NSString *vcamTrunc(NSString *s, NSUInteger n) {
-    if (!s || s.length <= n) return s ?: @"{}";
-    return [NSString stringWithFormat:@"%@...", [s substringToIndex:n]];
-}
-
-// still 到达诊断默认关闭(2026-08-19 UAF 崩溃修复): CMCopyDictionaryOfAttachments +
-// description 遍历与并发 hook 线程的元数据操作/CMCapture 管线访问同一 attachments
-// 字典存在竞态窗口(与 metaFix 同源)。诊断使命已完成, vc.plist "stillDiag=YES" 开启。
-static BOOL vcamStillDiagOn(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        @try {
-            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
-            cached = (d && d[@"stillDiag"]) ? [d[@"stillDiag"] boolValue] : 0;
-        } @catch (NSException *e) { cached = 0; }
-    }
-    return cached == 1;
-}
-
-// still 管线到达诊断: 像素亮度(定位增益发生段) + 全部附件(找曝光元数据真实 key)
-static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, CVPixelBufferRef pb) {
-    if (!pb || !vcamStillDiagOn()) return;
-    OSType fmt = CVPixelBufferGetPixelFormatType(pb);
-    NSString *sbA = @"{}", *pbA = @"{}";
-    if (sb) {
-        CFDictionaryRef d1 = CMCopyDictionaryOfAttachments(NULL, sb, kCMAttachmentMode_ShouldPropagate);
-        if (d1) { sbA = vcamTrunc([(NSDictionary *)CFBridgingRelease(d1) description], 700); }
-    }
-    CFDictionaryRef d2 = CMCopyDictionaryOfAttachments(NULL, pb, kCMAttachmentMode_ShouldPropagate);
-    if (d2) { pbA = vcamTrunc([(NSDictionary *)CFBridgingRelease(d2) description], 700); }
-    vcam_tweak_log([NSString stringWithFormat:
-        @"[vcam][still] %@#%d fmt=0x%x %zux%zu Y/G=%@ metaFix=%d sbAtts=%@ pbAtts=%@",
-        tag, idx, (unsigned)fmt, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
-        vcamLumaSamples(pb), vcamMetaFixOn(), sbA, pbA]);
-}
+// still 到达诊断路径已整体移除(2026-09-04 1.3.94):
+// 该诊断(vcamLumaSamples 5点十字采样 + CMCopyDictionaryOfAttachments 遍历)自 2026-08-19
+// 起即为已知 UAF/竞态崩溃源, 当时以"默认关闭 + vc.plist stillDiag=YES 显式开启"止血。
+// 2026-09-04 设备实证(1.3.92, iPhone X iOS15.1): 旧调试残留的 stillDiag=true 使该路径
+// 在生产复活, mediaserverd 反复 SIGSEGV(崩点=采样器 NSNumber 装箱循环 objc_release,
+// vcam_crash.txt 3 次, 崩溃→launchd 重拉→再崩死循环), 相机卡死+全 App 摄像头黑屏。
+// 结论: "默认关闭的 plist 开关"防不住设备残留配置, 诊断使命早已完成, 连根删除。
 
 #pragma mark - Hook 函数原始指针
 
@@ -305,10 +246,6 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                                 efmt == 0x7c386630 /* |8f0 */ ||
                                 efmt == 0x7c387630 /* |8v0 */);
             if (photoStream) {
-                vcamPhotoEmitCount++;
-                if (vcamPhotoEmitCount <= 16 || vcamPhotoEmitCount % 3600 == 0) {
-                    vcamDumpStillArrival(@"emitPhoto", vcamPhotoEmitCount, sampleBuffer, pixelBuffer);
-                }
                 vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             }
             // 照片缓冲流节流: CPU 配额保护(见 vcamPhotoStreamThrottled 注释)
@@ -342,11 +279,6 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
      @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压周期性结算停顿
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 到达诊断(替换前): 若此处像素已亮于 emit 时写入值, 增益发生在 emit→scaler 段
-            vcamScalerArrCount++;
-            if (vcamScalerArrCount <= 16 || vcamScalerArrCount % 3600 == 0) {
-                vcamDumpStillArrival(@"scaler", vcamScalerArrCount, sampleBuffer, pixelBuffer);
-            }
             // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             // 照片缓冲流节流: CPU 配额保护(emit 侧同一判定; encoder 快门路径不节流)
@@ -377,11 +309,6 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
      @autoreleasepool {   // 卡顿保险: 同 Hook2
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 到达诊断(替换前): 若此处正常而最终照片过曝, 增益发生在编码器内部(元数据剥离是唯一机会)
-            vcamEncoderArrCount++;
-            if (vcamEncoderArrCount <= 16 || vcamEncoderArrCount % 3600 == 0) {
-                vcamDumpStillArrival(@"encoder", vcamEncoderArrCount, sampleBuffer, pixelBuffer);
-            }
             // 曝光元数据剥离(编码前最后机会)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             @try {
